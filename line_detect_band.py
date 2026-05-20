@@ -67,8 +67,8 @@ RUN_FILE_END = 8
 # Angle settings
 # ============================================================
 
-ANGLE_STEP_DEG = 20
-ANGLES_DEG = list(range(0, 180, ANGLE_STEP_DEG))  # [0, 20, ..., 160]
+ANGLE_STEP_DEG = 22.5
+ANGLES_DEG = list(np.arange(0, 180, ANGLE_STEP_DEG))
 
 
 # ============================================================
@@ -76,10 +76,10 @@ ANGLES_DEG = list(range(0, 180, ANGLE_STEP_DEG))  # [0, 20, ..., 160]
 # ============================================================
 
 BAND_WIDTH_PIX = 75          # number of along-axis rows per band
-SYMMETRY_WINDOW_PIX = 13     # half-window for correlation (in cross-axis pixels)
-MIN_SYMMETRY_DIST_PIX = 18    # minimum distance between symmetric points
-N_TOP_SYMMETRY = 800         # max number of symmetric points globally across all angles×bands
-ADJACENT_BAND_TOL_PIX = 5    # max cross-axis offset for matching adjacent bands
+SYMMETRY_WINDOW_PIX = 15     # half-window for correlation (in cross-axis pixels)
+MIN_SYMMETRY_DIST_PIX = SYMMETRY_WINDOW_PIX*1.5    # minimum distance between symmetric points
+N_TOP_SYMMETRY = 500         # max number of symmetric points globally across all angles×bands
+ADJACENT_BAND_TOL_PIX = int(SYMMETRY_WINDOW_PIX/1)    # max cross-axis offset for matching adjacent bands
 MIN_CONSECUTIVE_BANDS = 2    # min consecutive bands to confirm a line
 
 
@@ -348,6 +348,9 @@ def find_symmetric_points_1d(curve, cross_centers_km, window_pix, min_distance_p
     top_idx = []
     top_corrs = []
     for idx in sorted_idx:
+        # Reject points too close to either end of the 1D curve
+        if idx < 2*window_pix or idx >= n - 2*window_pix:
+            continue
         if all(abs(idx - exist) > min_distance_pix for exist in top_idx):
             top_idx.append(int(idx))
             top_corrs.append(float(neg_corr[idx]))
@@ -530,25 +533,116 @@ def map_line_to_lonlat(line_pixels, grid_lon, grid_lat):
     return (p1[0], p1[1], p2[0], p2[1])
 
 
-def collect_all_sym_points(ref_rot, tb_rot, band_width_pix, window_pix, min_dist_pix,
-                           grid_lon, grid_lat):
+def compute_avg_correlation_1d(curve_ref, curve_tb, cross_centers_km, window_pix, min_distance_pix):
     """
-    Collect ALL symmetric points (unlimited) from all bands of both variables.
+    Compute the average negative correlation across two 1D curves at each position.
+
+    For each valid position i, compute the left-right symmetry correlation for
+    both curves, then take the average. This follows the approach in
+    Man2022samples_symmetric_points.py.
 
     Parameters
     ----------
-    ref_rot, tb_rot : ndarray
-        Reflectance and BT diff on rotated grid.
-    band_width_pix, window_pix, min_dist_pix : int
-        Detection parameters.
-    grid_lon, grid_lat : ndarray
-        Lon/lat of the rotated grid.
+    curve_ref, curve_tb : 1D ndarray
+        The 1D cross-axis profiles for reflectance and BT diff.
+    cross_centers_km : 1D ndarray
+        Cross-axis coordinate values in km.
+    window_pix : int
+        Half-window size for correlation calculation.
+    min_distance_pix : int
+        Minimum distance between detected symmetric points.
+
+    Returns
+    -------
+    neg_corr_avg : 1D ndarray
+        Average negative correlation at each position.
+    """
+    n = len(curve_ref)
+    neg_corr_avg = np.full(n, np.nan)
+
+    # Detrend both curves
+    curves_detrend = []
+    for curve in [curve_ref, curve_tb]:
+        mask_all = np.isfinite(curve)
+        curve_d = curve.copy()
+        if mask_all.sum() > 0:
+            curve_d[mask_all] = detrend(curve[mask_all], type='linear')
+        curves_detrend.append(curve_d)
+
+    for i in range(window_pix, n - window_pix):
+        local_corrs = []
+        for curve_d in curves_detrend:
+            left = curve_d[i - window_pix:i]
+            right = curve_d[i + 1:i + 1 + window_pix]
+            mask = np.isfinite(left) & np.isfinite(right)
+            if mask.sum() >= 5:
+                corr = np.corrcoef(left[mask], right[mask])[0, 1]
+                if np.isfinite(corr):
+                    local_corrs.append(corr)
+        if local_corrs:
+            neg_corr_avg[i] = np.mean(local_corrs)
+
+    return neg_corr_avg
+
+
+def find_symmetric_points_from_avg(neg_corr_avg, window_pix, min_distance_pix, n_top):
+    """
+    Find symmetric points from an averaged negative correlation array.
+
+    Parameters
+    ----------
+    neg_corr_avg : 1D ndarray
+        Average negative correlation at each position.
+    window_pix : int
+        Half-window size (used for boundary rejection).
+    min_distance_pix : int
+        Minimum distance between detected symmetric points.
+    n_top : int
+        Maximum number of top symmetric points to return.
+
+    Returns
+    -------
+    top_idx : list of int
+        Indices of symmetric points.
+    top_corrs : list of float
+        Correlation values at those points.
+    """
+    n = len(neg_corr_avg)
+    valid_idx = np.where(np.isfinite(neg_corr_avg))[0]
+    if len(valid_idx) == 0:
+        return [], []
+
+    sorted_idx = valid_idx[np.argsort(neg_corr_avg[valid_idx])]
+    top_idx = []
+    top_corrs = []
+    for idx in sorted_idx:
+        # Reject points too close to either end
+        if idx < 2 * window_pix or idx >= n - 2 * window_pix:
+            continue
+        if all(abs(idx - exist) > min_distance_pix for exist in top_idx):
+            top_idx.append(int(idx))
+            top_corrs.append(float(neg_corr_avg[idx]))
+        if len(top_idx) == n_top:
+            break
+
+    return top_idx, top_corrs
+
+
+def collect_all_sym_points(ref_rot, tb_rot, band_width_pix, window_pix, min_dist_pix):
+    """
+    Collect ALL symmetric points from all bands, using the average correlation
+    across both variables (reflectance and BT diff) for each band.
+
+    This follows the approach in Man2022samples_symmetric_points.py:
+    for each band, compute 1D curves for both variables, then for each
+    cross-axis position, average the left-right symmetry correlations
+    across both variables, then find symmetric points from the averaged
+    correlation.
 
     Returns
     -------
     all_points : list of dict
-        Each dict: {'band_idx': int, 'cross_idx': int, 'corr': float, 'var': str,
-                    'along_pos': float, 'lon': float, 'lat': float}
+        Each dict: {'band_idx': int, 'cross_idx': int, 'corr': float}
     band_centers : list of float
     band_edges : list of (float, float)
     n_along : int
@@ -557,40 +651,27 @@ def collect_all_sym_points(ref_rot, tb_rot, band_width_pix, window_pix, min_dist
     n_along, n_cross = ref_rot.shape
     cross_centers_km = np.linspace(-SIDE_LENGTH_KM / 2, SIDE_LENGTH_KM / 2, n_cross)
 
+    # Compute 1D curves for both variables
+    curves_ref, band_centers, band_edges = sum_bands_to_1d(ref_rot, band_width_pix)
+    curves_tb, _, _ = sum_bands_to_1d(tb_rot, band_width_pix)
+
     all_points = []
-    band_centers = None
-    band_edges = None
 
-    for data_rot, var_name in [(ref_rot, 'ref'), (tb_rot, 'tb')]:
-        curves, bc, be = sum_bands_to_1d(data_rot, band_width_pix)
-        if band_centers is None:
-            band_centers = bc
-            band_edges = be
+    for band_idx, (curve_ref, curve_tb) in enumerate(zip(curves_ref, curves_tb)):
+        # Compute average correlation across both variables
+        neg_corr_avg = compute_avg_correlation_1d(
+            curve_ref, curve_tb, cross_centers_km, window_pix, min_dist_pix)
 
-        for band_idx, curve in enumerate(curves):
-            # Use a very large n_top to get all possible symmetric points
-            top_idx, top_corrs = find_symmetric_points_1d(
-                curve, cross_centers_km, window_pix, min_dist_pix, n_top=999999)
-            # Along-axis position of this band's center
-            along_pos = band_centers[band_idx]
-            for ci, cr in zip(top_idx, top_corrs):
-                # Map to lon/lat
-                yi = int(round(along_pos))
-                xi = int(round(ci))
-                if 0 <= yi < n_along and 0 <= xi < n_cross:
-                    pt_lon = float(grid_lon[yi, xi])
-                    pt_lat = float(grid_lat[yi, xi])
-                else:
-                    pt_lon, pt_lat = np.nan, np.nan
-                all_points.append({
-                    'band_idx': band_idx,
-                    'cross_idx': ci,
-                    'corr': cr,
-                    'var': var_name,
-                    'along_pos': along_pos,
-                    'lon': pt_lon,
-                    'lat': pt_lat,
-                })
+        # Find symmetric points from the averaged correlation
+        top_idx, top_corrs = find_symmetric_points_from_avg(
+            neg_corr_avg, window_pix, min_dist_pix, n_top=999999)
+
+        for ci, cr in zip(top_idx, top_corrs):
+            all_points.append({
+                'band_idx': band_idx,
+                'cross_idx': ci,
+                'corr': cr,
+            })
 
     return all_points, band_centers, band_edges, n_along, n_cross
 
@@ -604,118 +685,29 @@ def filter_top_global_points(all_points, n_top):
     return sorted_pts[:n_top]
 
 
-def match_across_angles(center_angle_idx, angle_metadata, top_global,
+def match_and_fit_lines(filtered_points, band_centers, band_edges,
+                        n_along, n_cross, grid_lon, grid_lat,
                         tol_pix, min_consecutive):
     """
-    For a given center angle, merge its symmetric points with those from
-    adjacent angles (center ± 20°), map to lon/lat, sort by along-axis
-    position, re-band, and match.
-
-    Parameters
-    ----------
-    center_angle_idx : int
-        Index of the center angle in angle_metadata.
-    angle_metadata : list of dict
-        Per-angle metadata from Phase 1.
-    top_global : list of (angle_idx, point_dict)
-        Globally filtered top symmetric points.
-    tol_pix : int
-        Cross-axis tolerance for matching (in pixels of the center angle's grid).
-    min_consecutive : int
-        Minimum consecutive bands to form a line.
+    From filtered points, group by band, match adjacent bands, fit lines.
 
     Returns
     -------
     lines_lonlat : list of (lon1, lat1, lon2, lat2)
     """
-    n_angles = len(angle_metadata)
-    meta_center = angle_metadata[center_angle_idx]
+    n_bands = len(band_centers)
+    # Reconstruct all_band_sym_points from filtered points
+    all_band_sym_points = [[] for _ in range(n_bands)]
+    for p in filtered_points:
+        all_band_sym_points[p['band_idx']].append((p['cross_idx'], p['corr']))
 
-    # Collect points from center angle and its two neighbors
-    neighbor_idxs = [center_angle_idx]
-    if center_angle_idx > 0:
-        neighbor_idxs.append(center_angle_idx - 1)
-    if center_angle_idx < n_angles - 1:
-        neighbor_idxs.append(center_angle_idx + 1)
-
-    merged_points = []
-    for ai, p in top_global:
-        if ai in neighbor_idxs:
-            merged_points.append(p)
-
-    if len(merged_points) < 2:
-        return []
-
-    # Sort by along-axis position (in the center angle's coordinate system)
-    # We use the lon/lat of each point and project onto the center angle's
-    # along-axis direction to get a unified along-axis coordinate.
-    center_lon = CENTER_LON
-    center_lat = CENTER_LAT
-    angle_rad = np.deg2rad(ANGLES_DEG[center_angle_idx])
-    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-
-    # For each point, compute its projected along-axis position in km
-    # relative to the center of the region
-    for p in merged_points:
-        if not np.isfinite(p['lon']) or not np.isfinite(p['lat']):
-            p['proj_along'] = np.nan
-            continue
-        # Convert lon/lat offset to km
-        dx_km = (p['lon'] - center_lon) * (EARTH_RADIUS_KM * np.cos(np.deg2rad(center_lat)) * np.pi / 180.0)
-        dy_km = (p['lat'] - center_lat) * (EARTH_RADIUS_KM * np.pi / 180.0)
-        # Project onto the center angle's along-axis direction
-        p['proj_along'] = dx_km * sin_a + dy_km * cos_a
-
-    # Remove points with NaN projection
-    merged_points = [p for p in merged_points if np.isfinite(p.get('proj_along', np.nan))]
-    if len(merged_points) < 2:
-        return []
-
-    # Sort by projected along-axis position
-    merged_points.sort(key=lambda p: p['proj_along'])
-
-    # Re-band: divide the projected along-axis range into bands of BAND_WIDTH_PIX
-    # Convert BAND_WIDTH_PIX to km: band_width_km = BAND_WIDTH_PIX * RESOLUTION_M / 1000.0
-    band_width_km = BAND_WIDTH_PIX * RESOLUTION_M / 1000.0
-    proj_along_vals = np.array([p['proj_along'] for p in merged_points])
-    proj_min, proj_max = proj_along_vals.min(), proj_along_vals.max()
-
-    # Create bands
-    n_bands_re = max(1, int(np.ceil((proj_max - proj_min) / band_width_km)))
-    band_edges_re = []
-    for b in range(n_bands_re):
-        start = proj_min + b * band_width_km
-        end = min(proj_min + (b + 1) * band_width_km, proj_max)
-        band_edges_re.append((start, end))
-
-    # Assign each point to a band
-    all_band_sym_points = [[] for _ in range(n_bands_re)]
-    for p in merged_points:
-        for b, (b_start, b_end) in enumerate(band_edges_re):
-            if b_start <= p['proj_along'] <= b_end:
-                # Use cross_idx as the matching coordinate (in pixels of the center angle's grid)
-                all_band_sym_points[b].append((p['cross_idx'], p['corr']))
-                break
-
-    # Match adjacent bands
-    groups = match_adjacent_bands(all_band_sym_points, tol_pix, min_consecutive)
-    if not groups:
-        return []
-
-    # Fit lines and map to lon/lat using the center angle's grid
-    n_along = meta_center['n_along']
-    n_cross = meta_center['n_cross']
-    band_centers_center = meta_center['band_centers']
-    band_edges_center = meta_center['band_edges']
-    grid_lon = meta_center['rot_lon']
-    grid_lat = meta_center['rot_lat']
     cross_centers_km = np.linspace(-SIDE_LENGTH_KM / 2, SIDE_LENGTH_KM / 2, n_cross)
-
     lines_lonlat = []
+
+    groups = match_adjacent_bands(all_band_sym_points, tol_pix, min_consecutive)
     for group in groups:
         line_pixels = fit_line_from_group(
-            group, band_centers_center, band_edges_center,
-            cross_centers_km, n_along, n_cross)
+            group, band_centers, band_edges, cross_centers_km, n_along, n_cross)
         if line_pixels is None:
             continue
         line_lonlat = map_line_to_lonlat(line_pixels, grid_lon, grid_lat)
@@ -739,72 +731,76 @@ def get_color_limits(data):
 
 def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat):
     """
-    Plot 4 figures:
+    Plot a single figure with 2x2 subplots:
       1. Reflectance base map
       2. BT diff base map
       3. Reflectance + detected lines
       4. BT diff + detected lines
+
+    Lines whose endpoints fall outside the base grid extent are filtered out.
     """
     ref_vmin, ref_vmax = get_color_limits(ref_grid)
     tb_vmin, tb_vmax = get_color_limits(tb_grid)
 
     extent = [grid_lon[0, 0], grid_lon[0, -1], grid_lat[0, 0], grid_lat[-1, 0]]
 
-    # ---- Figure 1: Reflectance base ----
-    fig1, ax1 = plt.subplots(figsize=(10, 8), dpi=200)
+    # Filter lines: keep only those with both endpoints inside the base grid extent
+    lon_min, lon_max = extent[0], extent[1]
+    lat_min, lat_max = extent[2], extent[3]
+    filtered_lines = []
+    for lon1, lat1, lon2, lat2 in all_lines_lonlat:
+        if (lon_min <= lon1 <= lon_max and lat_min <= lat1 <= lat_max and
+            lon_min <= lon2 <= lon_max and lat_min <= lat2 <= lat_max):
+            filtered_lines.append((lon1, lat1, lon2, lat2))
+    all_lines_lonlat = filtered_lines
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12), dpi=200)
+
+    # ---- Subplot 1: Reflectance base ----
+    ax1 = axes[0, 0]
     im1 = ax1.imshow(ref_grid, cmap="jet", vmin=ref_vmin, vmax=ref_vmax,
                      extent=extent, origin="lower", interpolation="none")
-    ax1.set_title(f"{stem} - Reflectance 2.1um")
+    ax1.set_title("Reflectance 2.1um", fontsize=10)
     ax1.set_xlabel("Longitude")
     ax1.set_ylabel("Latitude")
     plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-    fig1.tight_layout()
-    fig1.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_band_ref_base.png"),
-                 bbox_inches="tight", dpi=200)
-    plt.close(fig1)
 
-    # ---- Figure 2: BT diff base ----
-    fig2, ax2 = plt.subplots(figsize=(10, 8), dpi=200)
+    # ---- Subplot 2: BT diff base ----
+    ax2 = axes[0, 1]
     im2 = ax2.imshow(tb_grid, cmap="RdBu_r", vmin=tb_vmin, vmax=tb_vmax,
                      extent=extent, origin="lower", interpolation="none")
-    ax2.set_title(f"{stem} - BT Diff 11um - 3.7um")
+    ax2.set_title("BT Diff 11um - 3.7um", fontsize=10)
     ax2.set_xlabel("Longitude")
     ax2.set_ylabel("Latitude")
     plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-    fig2.tight_layout()
-    fig2.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_band_tb_base.png"),
-                 bbox_inches="tight", dpi=200)
-    plt.close(fig2)
 
-    # ---- Figure 3: Reflectance + lines ----
-    fig3, ax3 = plt.subplots(figsize=(10, 8), dpi=200)
+    # ---- Subplot 3: Reflectance + lines ----
+    ax3 = axes[1, 0]
     ax3.imshow(ref_grid, cmap="jet", vmin=ref_vmin, vmax=ref_vmax,
                extent=extent, origin="lower", interpolation="none")
     for lon1, lat1, lon2, lat2 in all_lines_lonlat:
         ax3.plot([lon1, lon2], [lat1, lat2], '-', color='black', linewidth=1.5)
-    ax3.set_title(f"{stem} - Reflectance + detected lines ({len(all_lines_lonlat)} lines)")
+    ax3.set_title(f"Reflectance + detected lines ({len(all_lines_lonlat)} lines)", fontsize=10)
     ax3.set_xlabel("Longitude")
     ax3.set_ylabel("Latitude")
-    fig3.tight_layout()
-    fig3.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_band_ref_lines.png"),
-                 bbox_inches="tight", dpi=200)
-    plt.close(fig3)
 
-    # ---- Figure 4: BT diff + lines ----
-    fig4, ax4 = plt.subplots(figsize=(10, 8), dpi=200)
+    # ---- Subplot 4: BT diff + lines ----
+    ax4 = axes[1, 1]
     ax4.imshow(tb_grid, cmap="RdBu_r", vmin=tb_vmin, vmax=tb_vmax,
                extent=extent, origin="lower", interpolation="none")
     for lon1, lat1, lon2, lat2 in all_lines_lonlat:
         ax4.plot([lon1, lon2], [lat1, lat2], '-', color='black', linewidth=1.5)
-    ax4.set_title(f"{stem} - BT Diff + detected lines ({len(all_lines_lonlat)} lines)")
+    ax4.set_title(f"BT Diff + detected lines ({len(all_lines_lonlat)} lines)", fontsize=10)
     ax4.set_xlabel("Longitude")
     ax4.set_ylabel("Latitude")
-    fig4.tight_layout()
-    fig4.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_band_tb_lines.png"),
-                 bbox_inches="tight", dpi=200)
-    plt.close(fig4)
 
-    print(f"Saved 4 figures for {stem} ({len(all_lines_lonlat)} lines)")
+    fig.suptitle(stem, fontsize=14, y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_band_combined.png"),
+                bbox_inches="tight", dpi=200)
+    plt.close(fig)
+
+    print(f"Saved combined figure for {stem} ({len(all_lines_lonlat)} lines)")
 
 
 # ============================================================
@@ -899,8 +895,7 @@ def process_nc_files():
 
                 # Collect all symmetric points (unlimited)
                 points, bc, be, n_along, n_cross = collect_all_sym_points(
-                    ref_rot, tb_rot, BAND_WIDTH_PIX, SYMMETRY_WINDOW_PIX, MIN_SYMMETRY_DIST_PIX,
-                    rot_lon, rot_lat)
+                    ref_rot, tb_rot, BAND_WIDTH_PIX, SYMMETRY_WINDOW_PIX, MIN_SYMMETRY_DIST_PIX)
 
                 angle_idx = len(angle_metadata)
                 for p in points:
@@ -919,12 +914,19 @@ def process_nc_files():
             all_angle_points.sort(key=lambda x: x[1]['corr'])
             top_global = all_angle_points[:N_TOP_SYMMETRY]
 
-            # Phase 3: for each angle, merge with adjacent angles' points,
-            #          project to lon/lat, re-band, match, and fit lines
+            # Phase 3: for each angle, match and fit lines using only the kept points
             all_lines_lonlat = []
-            for angle_idx in range(len(angle_metadata)):
-                lines = match_across_angles(
-                    angle_idx, angle_metadata, top_global,
+            for angle_idx, meta in enumerate(angle_metadata):
+                # Collect points belonging to this angle
+                angle_filtered = [p for ai, p in top_global if ai == angle_idx]
+                if len(angle_filtered) < 2:
+                    continue
+
+                lines = match_and_fit_lines(
+                    angle_filtered,
+                    meta['band_centers'], meta['band_edges'],
+                    meta['n_along'], meta['n_cross'],
+                    meta['rot_lon'], meta['rot_lat'],
                     ADJACENT_BAND_TOL_PIX, MIN_CONSECUTIVE_BANDS)
                 all_lines_lonlat.extend(lines)
 

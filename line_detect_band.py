@@ -77,9 +77,9 @@ ANGLES_DEG = list(range(0, 180, ANGLE_STEP_DEG))  # [0, 20, ..., 160]
 
 BAND_WIDTH_PIX = 75          # number of along-axis rows per band
 SYMMETRY_WINDOW_PIX = 13     # half-window for correlation (in cross-axis pixels)
-MIN_SYMMETRY_DIST_PIX = 8    # minimum distance between symmetric points
-N_TOP_SYMMETRY = 10           # max number of symmetric points per 1D curve
-ADJACENT_BAND_TOL_PIX = 5    # max cross-axis offset for matching adjacent bands
+MIN_SYMMETRY_DIST_PIX = 13    # minimum distance between symmetric points
+N_TOP_SYMMETRY = 500         # max number of symmetric points globally across all angles×bands
+ADJACENT_BAND_TOL_PIX = 7    # max cross-axis offset for matching adjacent bands
 MIN_CONSECUTIVE_BANDS = 2    # min consecutive bands to confirm a line
 
 
@@ -530,54 +530,84 @@ def map_line_to_lonlat(line_pixels, grid_lon, grid_lat):
     return (p1[0], p1[1], p2[0], p2[1])
 
 
-def detect_lines_at_angle(ref_rot, tb_rot, grid_lon, grid_lat,
-                          band_width_pix, window_pix, min_dist_pix, n_top,
-                          tol_pix, min_consecutive):
+def collect_all_sym_points(ref_rot, tb_rot, band_width_pix, window_pix, min_dist_pix):
     """
-    Detect lines in a given rotated grid using band-based symmetric point matching.
-
-    Parameters
-    ----------
-    ref_rot : ndarray
-        Reflectance on rotated grid.
-    tb_rot : ndarray
-        BT diff on rotated grid.
-    grid_lon, grid_lat : ndarray
-        Lon/lat of the rotated grid.
-    ... (detection parameters)
+    Collect ALL symmetric points (unlimited) from all bands of both variables.
 
     Returns
     -------
-    lines_lonlat : list of (lon1, lat1, lon2, lat2)
-        Detected lines in lon/lat coordinates.
+    all_points : list of dict
+        Each dict: {'band_idx': int, 'cross_idx': int, 'corr': float, 'var': str}
+    band_centers : list of float
+    band_edges : list of (float, float)
+    n_along : int
+    n_cross : int
     """
     n_along, n_cross = ref_rot.shape
     cross_centers_km = np.linspace(-SIDE_LENGTH_KM / 2, SIDE_LENGTH_KM / 2, n_cross)
 
+    all_points = []
+    band_centers = None
+    band_edges = None
+
+    for data_rot, var_name in [(ref_rot, 'ref'), (tb_rot, 'tb')]:
+        curves, bc, be = sum_bands_to_1d(data_rot, band_width_pix)
+        if band_centers is None:
+            band_centers = bc
+            band_edges = be
+
+        for band_idx, curve in enumerate(curves):
+            # Use a very large n_top to get all possible symmetric points
+            top_idx, top_corrs = find_symmetric_points_1d(
+                curve, cross_centers_km, window_pix, min_dist_pix, n_top=999999)
+            for ci, cr in zip(top_idx, top_corrs):
+                all_points.append({
+                    'band_idx': band_idx,
+                    'cross_idx': ci,
+                    'corr': cr,
+                    'var': var_name,
+                })
+
+    return all_points, band_centers, band_edges, n_along, n_cross
+
+
+def filter_top_global_points(all_points, n_top):
+    """Keep only the top n_top points globally by correlation (most negative)."""
+    if len(all_points) <= n_top:
+        return all_points
+    # Sort by correlation (most negative first)
+    sorted_pts = sorted(all_points, key=lambda p: p['corr'])
+    return sorted_pts[:n_top]
+
+
+def match_and_fit_lines(filtered_points, band_centers, band_edges,
+                        n_along, n_cross, grid_lon, grid_lat,
+                        tol_pix, min_consecutive):
+    """
+    From filtered points, group by band, match adjacent bands, fit lines.
+
+    Returns
+    -------
+    lines_lonlat : list of (lon1, lat1, lon2, lat2)
+    """
+    n_bands = len(band_centers)
+    # Reconstruct all_band_sym_points from filtered points
+    all_band_sym_points = [[] for _ in range(n_bands)]
+    for p in filtered_points:
+        all_band_sym_points[p['band_idx']].append((p['cross_idx'], p['corr']))
+
+    cross_centers_km = np.linspace(-SIDE_LENGTH_KM / 2, SIDE_LENGTH_KM / 2, n_cross)
     lines_lonlat = []
 
-    for data_rot, name in [(ref_rot, 'ref'), (tb_rot, 'tb')]:
-        curves, band_centers, band_edges = sum_bands_to_1d(data_rot, band_width_pix)
-
-        # Find symmetric points in each band
-        all_band_sym_points = []
-        for curve in curves:
-            top_idx, top_corrs = find_symmetric_points_1d(
-                curve, cross_centers_km, window_pix, min_dist_pix, n_top)
-            all_band_sym_points.append(list(zip(top_idx, top_corrs)))
-
-        # Match across adjacent bands
-        groups = match_adjacent_bands(all_band_sym_points, tol_pix, min_consecutive)
-
-        # Fit lines and map to lon/lat
-        for group in groups:
-            line_pixels = fit_line_from_group(
-                group, band_centers, band_edges, cross_centers_km, n_along, n_cross)
-            if line_pixels is None:
-                continue
-            line_lonlat = map_line_to_lonlat(line_pixels, grid_lon, grid_lat)
-            if line_lonlat is not None:
-                lines_lonlat.append(line_lonlat)
+    groups = match_adjacent_bands(all_band_sym_points, tol_pix, min_consecutive)
+    for group in groups:
+        line_pixels = fit_line_from_group(
+            group, band_centers, band_edges, cross_centers_km, n_along, n_cross)
+        if line_pixels is None:
+            continue
+        line_lonlat = map_line_to_lonlat(line_pixels, grid_lon, grid_lat)
+        if line_lonlat is not None:
+            lines_lonlat.append(line_lonlat)
 
     return lines_lonlat
 
@@ -739,8 +769,9 @@ def process_nc_files():
                 print(f"Skipped (invalid data): {stem}")
                 continue
 
-            # Detect lines at each angle
-            all_lines_lonlat = []
+            # Phase 1: collect ALL symmetric points from all angles (unlimited)
+            all_angle_points = []  # list of (angle_idx, point_dict)
+            angle_metadata = []    # per-angle: (rot_lon, rot_lat, band_centers, band_edges, n_along, n_cross)
 
             for angle in ANGLES_DEG:
                 # Build rotated grid for this angle
@@ -753,10 +784,40 @@ def process_nc_files():
                 tb_rot, _ = resample_to_grid(tb_base, base_lon, base_lat,
                                               rot_lon, rot_lat, margin_deg=CROP_MARGIN_DEG)
 
-                # Detect lines at this angle
-                lines = detect_lines_at_angle(
-                    ref_rot, tb_rot, rot_lon, rot_lat,
-                    BAND_WIDTH_PIX, SYMMETRY_WINDOW_PIX, MIN_SYMMETRY_DIST_PIX, N_TOP_SYMMETRY,
+                # Collect all symmetric points (unlimited)
+                points, bc, be, n_along, n_cross = collect_all_sym_points(
+                    ref_rot, tb_rot, BAND_WIDTH_PIX, SYMMETRY_WINDOW_PIX, MIN_SYMMETRY_DIST_PIX)
+
+                angle_idx = len(angle_metadata)
+                for p in points:
+                    all_angle_points.append((angle_idx, p))
+                angle_metadata.append({
+                    'rot_lon': rot_lon,
+                    'rot_lat': rot_lat,
+                    'band_centers': bc,
+                    'band_edges': be,
+                    'n_along': n_along,
+                    'n_cross': n_cross,
+                })
+
+            # Phase 2: globally rank all symmetric points, keep top N_TOP_SYMMETRY
+            # Sort by correlation (most negative first)
+            all_angle_points.sort(key=lambda x: x[1]['corr'])
+            top_global = all_angle_points[:N_TOP_SYMMETRY]
+
+            # Phase 3: for each angle, match and fit lines using only the kept points
+            all_lines_lonlat = []
+            for angle_idx, meta in enumerate(angle_metadata):
+                # Collect points belonging to this angle
+                angle_filtered = [p for ai, p in top_global if ai == angle_idx]
+                if len(angle_filtered) < 2:
+                    continue
+
+                lines = match_and_fit_lines(
+                    angle_filtered,
+                    meta['band_centers'], meta['band_edges'],
+                    meta['n_along'], meta['n_cross'],
+                    meta['rot_lon'], meta['rot_lat'],
                     ADJACENT_BAND_TOL_PIX, MIN_CONSECUTIVE_BANDS)
                 all_lines_lonlat.extend(lines)
 

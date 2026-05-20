@@ -42,10 +42,10 @@ LINES_OUT_DIR = "/home/chenyiqi/260306_shiptrack_detect/lines_figs"
 # Target region parameters
 # ============================================================
 
-CENTER_LON = -75.5
-CENTER_LAT = -22.5
+CENTER_LON = -77
+CENTER_LAT = -20
 SIDE_LENGTH_KM = 750.0
-RESOLUTION_M = 4000.0
+RESOLUTION_M = 1000.0
 
 CROP_MARGIN_DEG = 0.30
 EARTH_RADIUS_KM = 6371.0
@@ -75,7 +75,7 @@ EDGE_KERNEL_WIDTH_PIX = 10
 EDGE_KERNEL_ZERO_GAP_PIX = 0
 EDGE_KERNEL_LENGTH_PIX = None
 
-EDGE_RESPONSE_PERCENTILE = 85
+EDGE_RESPONSE_PERCENTILE = 75
 
 
 # ============================================================

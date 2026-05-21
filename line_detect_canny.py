@@ -67,13 +67,16 @@ RUN_FILE_END = 8
 TREND_FILTER_SIZE = 101
 
 # Canny parameters
-CANNY_SIGMA = 3.0
+CANNY_SIGMA = 6.0
 CANNY_LOW_THRESHOLD = 0.05
 CANNY_HIGH_THRESHOLD = 0.15
 
 # Hough transform parameters
 HOUGH_THRESHOLD_FRAC = 0.3   # fraction of max accumulator value as threshold
 HOUGH_MIN_LINE_LENGTH_KM = 50.0  # minimum line length in km
+
+# Morphological enhancement kernel size
+MORPH_KERNEL_SIZE = 20
 
 
 
@@ -270,18 +273,25 @@ def remove_trend_median(data, filter_size):
 
 def enhance_morphological(data, erode_small=True, kernel_size=3):
     """
-    Enhance features by eroding small values and dilating large values.
+    Enhance features by morphological operations.
 
-    For ref (erode_small=True): small values → eroded, large values → dilated.
-    For BT (erode_small=False): large values → eroded, small values → dilated.
+    For ref (erode_small=True): apply grey_dilation to the whole image.
+        - Small values (dark) get replaced by neighboring larger values → "eroded away"
+        - Large values (bright) get expanded → "dilated"
+        Net effect: bright features are enhanced, dark features suppressed.
+
+    For BT (erode_small=False): apply grey_erosion to the whole image.
+        - Large values (bright) get replaced by neighboring smaller values → "eroded away"
+        - Small values (dark) get expanded → "dilated"
+        Net effect: dark features are enhanced, bright features suppressed.
 
     Parameters
     ----------
     data : ndarray
         2D image.
     erode_small : bool
-        If True, erode small values and dilate large values.
-        If False, erode large values and dilate small values.
+        If True, apply dilation (erode small values, dilate large values).
+        If False, apply erosion (erode large values, dilate small values).
     kernel_size : int
         Size of the morphological kernel.
 
@@ -306,20 +316,11 @@ def enhance_morphological(data, erode_small=True, kernel_size=3):
     filled = np.where(np.isfinite(normed), normed, 0.0)
 
     if erode_small:
-        # Erode small values (dark areas), dilate large values (bright areas)
-        eroded = grey_erosion(filled, size=kernel_size)
-        dilated = grey_dilation(filled, size=kernel_size)
-        # Combine: take eroded where original is small, dilated where original is large
-        # Use the original as a blending mask
-        enhanced = filled * dilated + (1 - filled) * eroded
+        # Dilation: small values get replaced by neighboring larger values
+        enhanced = grey_dilation(filled, size=kernel_size)
     else:
-        # Erode large values (bright areas), dilate small values (dark areas)
-        # Invert: treat (1 - filled) as the "small" side
-        eroded_inv = grey_erosion(1 - filled, size=kernel_size)
-        dilated_inv = grey_dilation(1 - filled, size=kernel_size)
-        # Combine: take eroded_inv where (1-filled) is small → original is large
-        # dilated_inv where (1-filled) is large → original is small
-        enhanced = (1 - filled) * dilated_inv + filled * eroded_inv
+        # Erosion: large values get replaced by neighboring smaller values
+        enhanced = grey_erosion(filled, size=kernel_size)
 
     return enhanced
 
@@ -364,18 +365,56 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
         Binary edge map from BT diff Canny.
     edges_merged : ndarray
         Merged edge map (OR of both).
+    ref_norm : ndarray
+        Normalized Reflectance residual (before morphological enhancement).
+    tb_norm : ndarray
+        Normalized BT diff residual (before morphological enhancement).
     ref_enhanced : ndarray
         Morphologically enhanced Reflectance residual.
     tb_enhanced : ndarray
         Morphologically enhanced BT diff residual.
+    ref_morph_detrend : ndarray
+        Reflectance after morph + second trend removal.
+    tb_morph_detrend : ndarray
+        BT diff after morph + second trend removal.
     """
     n_rows, n_cols = ref_residual.shape
 
-    # Apply morphological enhancement
-    ref_enhanced = enhance_morphological(ref_residual, erode_small=True)
-    tb_enhanced = enhance_morphological(tb_residual, erode_small=False)
+    # Normalize residuals to [0, 1] for display (before morph)
+    def normalize_to_01(arr):
+        valid = np.isfinite(arr)
+        if not np.any(valid):
+            return np.zeros_like(arr)
+        vmin, vmax = np.nanpercentile(arr, 2), np.nanpercentile(arr, 98)
+        if vmax <= vmin:
+            return np.zeros_like(arr)
+        normed = (arr - vmin) / (vmax - vmin)
+        return np.clip(normed, 0, 1)
 
-    # Canny edge detection separately on each enhanced image
+    ref_norm = normalize_to_01(ref_residual)
+    tb_norm = normalize_to_01(tb_residual)
+
+    # Apply morphological enhancement
+    ref_enhanced = enhance_morphological(ref_residual, erode_small=True, kernel_size=MORPH_KERNEL_SIZE)
+    tb_enhanced = enhance_morphological(tb_residual, erode_small=False, kernel_size=MORPH_KERNEL_SIZE)
+
+    # Second trend removal after morphological enhancement
+    ref_morph_detrend, _ = remove_trend_median(ref_enhanced, TREND_FILTER_SIZE)
+    tb_morph_detrend, _ = remove_trend_median(tb_enhanced, TREND_FILTER_SIZE)
+
+    # Normalize the post-morph detrended images for display
+    ref_morph_detrend_norm = normalize_to_01(ref_morph_detrend)
+    tb_morph_detrend_norm = normalize_to_01(tb_morph_detrend)
+
+    # Fuse: ref_morph_detrend - tb_morph_detrend
+    diff = ref_morph_detrend - tb_morph_detrend
+    diff_norm = normalize_to_01(diff)
+
+    # Take top 10% as binary
+    threshold_top10 = np.nanpercentile(diff, 90)
+    binary = np.where(np.isfinite(diff) & (diff >= threshold_top10), 1, 0)
+
+    # Canny edge detection separately on each enhanced image (for display only)
     edges_ref = canny(ref_enhanced, sigma=canny_sigma,
                       low_threshold=low_threshold,
                       high_threshold=high_threshold)
@@ -386,30 +425,21 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
     # Merge edges with OR
     edges_merged = edges_ref | edges_tb
 
-    # Hough transform on merged edges
-    h, theta, d = hough_line(edges_merged)
+    # Hough transform on the binary top-10% image
+    h, theta, d = hough_line(binary)
 
     # Find peaks in Hough accumulator
-    # hough_line_peaks returns (accumulator_values, angles, distances)
-    # We need to set a threshold
     threshold = hough_threshold_frac * np.max(h)
     _, angles, dists = hough_line_peaks(h, theta, d, threshold=threshold)
 
     if len(angles) == 0:
-        return [], edges_ref, edges_tb, edges_merged, ref_enhanced, tb_enhanced
+        return [], edges_ref, edges_tb, edges_merged, ref_norm, tb_norm, ref_enhanced, tb_enhanced, ref_morph_detrend_norm, tb_morph_detrend_norm, diff_norm, binary
 
     # Convert Hough lines to line segments in pixel coordinates
-    # Each Hough line is defined by (angle, distance).
-    # We need to find where the line intersects the image boundaries.
     lines_pixels = []
     for angle, dist in zip(angles, dists):
-        # Line equation: x * cos(theta) + y * sin(theta) = dist
         cos_a = np.cos(angle)
         sin_a = np.sin(angle)
-
-        # Find intersection with image boundaries (x=0, x=n_cols-1, y=0, y=n_rows-1)
-        # y = (dist - x * cos_a) / sin_a  (if sin_a != 0)
-        # x = (dist - y * sin_a) / cos_a  (if cos_a != 0)
 
         intersections = []
 
@@ -428,9 +458,7 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
                     intersections.append((x, y))
 
         if len(intersections) >= 2:
-            # Take the two farthest points as endpoints
             pts = np.array(intersections[:2])
-            # Compute length in km
             dx_km = (pts[1, 0] - pts[0, 0]) * RESOLUTION_M / 1000.0
             dy_km = (pts[1, 1] - pts[0, 1]) * RESOLUTION_M / 1000.0
             length_km = np.hypot(dx_km, dy_km)
@@ -452,7 +480,7 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
         if p1 is not None and p2 is not None:
             lines_lonlat.append((p1[0], p1[1], p2[0], p2[1]))
 
-    return lines_lonlat, edges_ref, edges_tb, edges_merged, ref_enhanced, tb_enhanced
+    return lines_lonlat, edges_ref, edges_tb, edges_merged, ref_norm, tb_norm, ref_enhanced, tb_enhanced, ref_morph_detrend_norm, tb_morph_detrend_norm, diff_norm, binary
 
 
 # ============================================================
@@ -468,13 +496,17 @@ def get_color_limits(data):
 
 
 def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
+                 ref_norm=None, tb_norm=None,
                  ref_enhanced=None, tb_enhanced=None,
+                 ref_morph_detrend=None, tb_morph_detrend=None,
+                 diff_norm=None, binary=None,
                  edges_ref=None, edges_tb=None, edges_merged=None):
     """
-    Plot a single figure with 3x3 subplots:
-      Row 0: Ref original | Ref enhanced (morphological) | Ref Canny edges
-      Row 1: BT original  | BT enhanced (morphological)  | BT Canny edges
-      Row 2: Ref + lines  | BT + lines                   | Merged Canny edges
+    Plot a single figure with 4x4 subplots:
+      Row 0: Ref original | Ref residual (before morph) | Ref enhanced (after morph) | Ref morph + detrend
+      Row 1: BT original  | BT residual (before morph)  | BT enhanced (after morph)  | BT morph + detrend
+      Row 2: Ref Canny edges | BT Canny edges | Merged Canny edges | Diff (ref - bt)
+      Row 3: Ref + lines  | BT + lines | Binary (top 10%) | (info)
 
     Lines whose endpoints fall outside the base grid extent are filtered out.
     """
@@ -493,7 +525,7 @@ def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
             filtered_lines.append((lon1, lat1, lon2, lat2))
     all_lines_lonlat = filtered_lines
 
-    fig, axes = plt.subplots(3, 3, figsize=(18, 15), dpi=200)
+    fig, axes = plt.subplots(4, 4, figsize=(24, 20), dpi=200)
 
     # ---- Row 0: Reflectance ----
     # (0,0) Ref original
@@ -505,21 +537,33 @@ def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
     ax.set_ylabel("Latitude")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    # (0,1) Ref enhanced (morphological)
+    # (0,1) Ref residual (before morph)
     ax = axes[0, 1]
-    if ref_enhanced is not None:
-        im = ax.imshow(ref_enhanced, cmap="gray", vmin=0, vmax=1,
+    if ref_norm is not None:
+        im = ax.imshow(ref_norm, cmap="gray", vmin=0, vmax=1,
                        extent=extent, origin="lower", interpolation="none")
-        ax.set_title("Reflectance enhanced (erode small, dilate large)", fontsize=9)
+        ax.set_title("Reflectance residual (before morph)", fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
-    # (0,2) Ref Canny edges
+    # (0,2) Ref enhanced (after morph)
     ax = axes[0, 2]
-    if edges_ref is not None:
-        ax.imshow(edges_ref, cmap="gray", extent=extent, origin="lower", interpolation="none")
-        ax.set_title("Canny edges (Reflectance)", fontsize=9)
+    if ref_enhanced is not None:
+        im = ax.imshow(ref_enhanced, cmap="gray", vmin=0, vmax=1,
+                       extent=extent, origin="lower", interpolation="none")
+        ax.set_title(f"Reflectance enhanced (kernel={MORPH_KERNEL_SIZE})", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (0,3) Ref morph + detrend
+    ax = axes[0, 3]
+    if ref_morph_detrend is not None:
+        im = ax.imshow(ref_morph_detrend, cmap="gray", vmin=0, vmax=1,
+                       extent=extent, origin="lower", interpolation="none")
+        ax.set_title("Reflectance morph + detrend", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
@@ -533,42 +577,50 @@ def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
     ax.set_ylabel("Latitude")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    # (1,1) BT enhanced (morphological)
+    # (1,1) BT residual (before morph)
     ax = axes[1, 1]
-    if tb_enhanced is not None:
-        im = ax.imshow(tb_enhanced, cmap="gray", vmin=0, vmax=1,
+    if tb_norm is not None:
+        im = ax.imshow(tb_norm, cmap="gray", vmin=0, vmax=1,
                        extent=extent, origin="lower", interpolation="none")
-        ax.set_title("BT Diff enhanced (erode large, dilate small)", fontsize=9)
+        ax.set_title("BT Diff residual (before morph)", fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
-    # (1,2) BT Canny edges
+    # (1,2) BT enhanced (after morph)
     ax = axes[1, 2]
+    if tb_enhanced is not None:
+        im = ax.imshow(tb_enhanced, cmap="gray", vmin=0, vmax=1,
+                       extent=extent, origin="lower", interpolation="none")
+        ax.set_title(f"BT Diff enhanced (kernel={MORPH_KERNEL_SIZE})", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (1,3) BT morph + detrend
+    ax = axes[1, 3]
+    if tb_morph_detrend is not None:
+        im = ax.imshow(tb_morph_detrend, cmap="gray", vmin=0, vmax=1,
+                       extent=extent, origin="lower", interpolation="none")
+        ax.set_title("BT Diff morph + detrend", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # ---- Row 2: Canny edges ----
+    # (2,0) Ref Canny edges
+    ax = axes[2, 0]
+    if edges_ref is not None:
+        ax.imshow(edges_ref, cmap="gray", extent=extent, origin="lower", interpolation="none")
+        ax.set_title("Canny edges (Reflectance)", fontsize=9)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (2,1) BT Canny edges
+    ax = axes[2, 1]
     if edges_tb is not None:
         ax.imshow(edges_tb, cmap="gray", extent=extent, origin="lower", interpolation="none")
         ax.set_title("Canny edges (BT diff)", fontsize=9)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-
-    # ---- Row 2: Data + lines ----
-    # (2,0) Reflectance + lines
-    ax = axes[2, 0]
-    ax.imshow(ref_grid, cmap="gray", vmin=ref_vmin, vmax=ref_vmax,
-              extent=extent, origin="lower", interpolation="none")
-    for lon1, lat1, lon2, lat2 in all_lines_lonlat:
-        ax.plot([lon1, lon2], [lat1, lat2], '-', color='red', linewidth=1.5)
-    ax.set_title(f"Reflectance + lines ({len(all_lines_lonlat)} lines)", fontsize=9)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-
-    # (2,1) BT diff + lines
-    ax = axes[2, 1]
-    ax.imshow(tb_grid, cmap="gray", vmin=tb_vmin, vmax=tb_vmax,
-              extent=extent, origin="lower", interpolation="none")
-    for lon1, lat1, lon2, lat2 in all_lines_lonlat:
-        ax.plot([lon1, lon2], [lat1, lat2], '-', color='red', linewidth=1.5)
-    ax.set_title(f"BT Diff + lines ({len(all_lines_lonlat)} lines)", fontsize=9)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
@@ -579,6 +631,63 @@ def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
         ax.set_title(f"Merged Canny edges (sigma={CANNY_SIGMA})", fontsize=9)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
+
+    # (2,3) Diff (ref - bt)
+    ax = axes[2, 3]
+    if diff_norm is not None:
+        im = ax.imshow(diff_norm, cmap="gray", vmin=0, vmax=1,
+                       extent=extent, origin="lower", interpolation="none")
+        ax.set_title("Diff (ref - bt) after morph+detrend", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # ---- Row 3: Data + lines ----
+    # (3,0) Reflectance + lines
+    ax = axes[3, 0]
+    ax.imshow(ref_grid, cmap="gray", vmin=ref_vmin, vmax=ref_vmax,
+              extent=extent, origin="lower", interpolation="none")
+    for lon1, lat1, lon2, lat2 in all_lines_lonlat:
+        ax.plot([lon1, lon2], [lat1, lat2], '-', color='red', linewidth=1.5)
+    ax.set_title(f"Reflectance + lines ({len(all_lines_lonlat)} lines)", fontsize=9)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (3,1) BT diff + lines
+    ax = axes[3, 1]
+    ax.imshow(tb_grid, cmap="gray", vmin=tb_vmin, vmax=tb_vmax,
+              extent=extent, origin="lower", interpolation="none")
+    for lon1, lat1, lon2, lat2 in all_lines_lonlat:
+        ax.plot([lon1, lon2], [lat1, lat2], '-', color='red', linewidth=1.5)
+    ax.set_title(f"BT Diff + lines ({len(all_lines_lonlat)} lines)", fontsize=9)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (3,2) Binary (top 10%)
+    ax = axes[3, 2]
+    if binary is not None:
+        ax.imshow(binary, cmap="gray", vmin=0, vmax=1,
+                  extent=extent, origin="lower", interpolation="none")
+        ax.set_title("Binary (top 10% of diff)", fontsize=9)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (3,3) Info
+    ax = axes[3, 3]
+    ax.axis("off")
+    info_text = (
+        f"File: {stem}\n"
+        f"Filter size: {TREND_FILTER_SIZE}\n"
+        f"Morph kernel: {MORPH_KERNEL_SIZE}\n"
+        f"Canny sigma: {CANNY_SIGMA}\n"
+        f"Canny low/high: {CANNY_LOW_THRESHOLD}/{CANNY_HIGH_THRESHOLD}\n"
+        f"Hough threshold frac: {HOUGH_THRESHOLD_FRAC}\n"
+        f"Min line length: {HOUGH_MIN_LINE_LENGTH_KM} km\n"
+        f"Detected lines: {len(all_lines_lonlat)}"
+    )
+    ax.text(0.5, 0.5, info_text, transform=ax.transAxes,
+            fontsize=10, ha='center', va='center',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     fig.suptitle(stem, fontsize=14, y=0.98)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -670,14 +779,19 @@ def process_nc_files():
 
             # Step 2: Detect lines using Canny + Hough (separately on each variable)
             (lines_lonlat, edges_ref, edges_tb, edges_merged,
-             ref_enhanced, tb_enhanced) = detect_lines_canny_hough(
+             ref_norm, tb_norm, ref_enhanced, tb_enhanced,
+             ref_morph_detrend, tb_morph_detrend,
+             diff_norm, binary) = detect_lines_canny_hough(
                 ref_residual, tb_residual, base_lon, base_lat,
                 CANNY_SIGMA, CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD,
                 HOUGH_THRESHOLD_FRAC, HOUGH_MIN_LINE_LENGTH_KM)
 
             # Step 3: Plot results
             plot_results(stem, ref_base, tb_base, lines_lonlat, base_lon, base_lat,
+                         ref_norm=ref_norm, tb_norm=tb_norm,
                          ref_enhanced=ref_enhanced, tb_enhanced=tb_enhanced,
+                         ref_morph_detrend=ref_morph_detrend, tb_morph_detrend=tb_morph_detrend,
+                         diff_norm=diff_norm, binary=binary,
                          edges_ref=edges_ref, edges_tb=edges_tb, edges_merged=edges_merged)
 
         finally:

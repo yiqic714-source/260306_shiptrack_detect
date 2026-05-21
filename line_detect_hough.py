@@ -14,7 +14,8 @@ Workflow:
    Shorter segments use a larger angle tolerance during duplicate grouping.
 10. Replace each duplicate group with one fitted representative line.
 11. After duplicate-group fitting, remove line segments shorter than 60 km.
-12. Filter lines outside the base grid extent and plot useful diagnostic panels.
+12. Plot only one output panel: BT original image with final fitted lines.
+13. Ref and BT are assumed to share the same geolocation mapping, so lat/lon resizing is done once.
 """
 
 import os
@@ -60,8 +61,8 @@ k = 1.380649e-23
 # File range control, 1-based inclusive
 # ============================================================
 
-RUN_FILE_START = 8
-RUN_FILE_END = 8
+RUN_FILE_START = 74
+RUN_FILE_END = 100
 
 
 # ============================================================
@@ -97,7 +98,7 @@ LINE_NMS_ANGLE_DEG_SHORT = 35.0
 LINE_NMS_ANGLE_DEG_LONG = 5.0
 LINE_NMS_SHORT_LENGTH_PX = float(HOUGH_MIN_LINE_LENGTH)
 LINE_NMS_LONG_LENGTH_PX = 150.0
-LINE_NMS_PERP_DIST_PX = 10.0
+LINE_NMS_PERP_DIST_PX = 15.0
 LINE_NMS_MAX_PROJ_GAP_PX = 30.0
 
 
@@ -548,94 +549,43 @@ def detect_lines(ref_residual, tb_residual, grid_lon, grid_lat,
                  hough_threshold, hough_min_line_length,
                  hough_max_line_gap):
     """
-    Apply morphological enhancement, second trend removal, fuse,
-    binarize (top 10%), skeletonize,
-    then extract straight lines using probabilistic Hough transform.
+    Apply morphological enhancement, second trend removal, fusion,
+    binarization, skeletonization and probabilistic Hough transform.
+
     Duplicate nearby, nearly parallel and overlapping/gapped Hough segments
     are grouped first. Each duplicate group is then replaced by one fitted
-    representative line. Shorter segments use a larger angle tolerance during
-    this duplicate check.
-
-    Parameters
-    ----------
-    ref_residual, tb_residual : ndarray
-        Residual images after trend removal.
-    grid_lon, grid_lat : ndarray
-        Lon/lat of the base grid.
-    hough_threshold : int
-        Accumulator threshold for probabilistic Hough.
-    hough_min_line_length : int
-        Minimum line length in pixels for probabilistic Hough.
-    hough_max_line_gap : int
-        Maximum gap between segments to connect.
+    representative line. Lines shorter than FINAL_MIN_LINE_LENGTH_KM are
+    removed after duplicate-group fitting.
 
     Returns
     -------
     lines_lonlat : list of (lon1, lat1, lon2, lat2)
-        Fitted representative lines after duplicate grouping and the final 60 km
-        length filter, in lon/lat coordinates.
-    lines_lonlat_before_nms : list of (lon1, lat1, lon2, lat2)
-        Raw Hough lines before duplicate suppression, in lon/lat coordinates.
-    ref_norm : ndarray
-        Normalized Reflectance residual (before morphological enhancement).
-    tb_norm : ndarray
-        Normalized BT diff residual (before morphological enhancement).
-    ref_enhanced : ndarray
-        Morphologically enhanced Reflectance residual.
-    tb_enhanced : ndarray
-        Morphologically enhanced BT diff residual.
-    ref_morph_detrend : ndarray
-        Reflectance after morph + second trend removal.
-    tb_morph_detrend : ndarray
-        BT diff after morph + second trend removal.
-    diff_norm : ndarray
-        Normalized diff (ref - bt) after morph+detrend.
-    binary : ndarray
-        Binary image (top 10% of diff).
-    skeleton : ndarray
-        Skeletonized binary (single-pixel-wide lines).
+        Final fitted representative lines in lon/lat coordinates.
     """
     n_rows, n_cols = ref_residual.shape
 
-    # Normalize residuals to [0, 1] for display (before morph)
-    def normalize_to_01(arr):
-        valid = np.isfinite(arr)
-        if not np.any(valid):
-            return np.zeros_like(arr)
-        vmin, vmax = np.nanpercentile(arr, 2), np.nanpercentile(arr, 98)
-        if vmax <= vmin:
-            return np.zeros_like(arr)
-        normed = (arr - vmin) / (vmax - vmin)
-        return np.clip(normed, 0, 1)
+    # Apply morphological enhancement.
+    ref_enhanced = enhance_morphological(
+        ref_residual, erode_small=True, kernel_size=MORPH_KERNEL_SIZE)
+    tb_enhanced = enhance_morphological(
+        tb_residual, erode_small=False, kernel_size=MORPH_KERNEL_SIZE)
 
-    ref_norm = normalize_to_01(ref_residual)
-    tb_norm = normalize_to_01(tb_residual)
-
-    # Apply morphological enhancement
-    ref_enhanced = enhance_morphological(ref_residual, erode_small=True, kernel_size=MORPH_KERNEL_SIZE)
-    tb_enhanced = enhance_morphological(tb_residual, erode_small=False, kernel_size=MORPH_KERNEL_SIZE)
-
-    # Second trend removal after morphological enhancement
+    # Second trend removal after morphological enhancement.
     ref_morph_detrend, _ = remove_trend_median(ref_enhanced, TREND_FILTER_SIZE)
     tb_morph_detrend, _ = remove_trend_median(tb_enhanced, TREND_FILTER_SIZE)
 
-    # Normalize the post-morph detrended images for display
-    ref_morph_detrend_norm = normalize_to_01(ref_morph_detrend)
-    tb_morph_detrend_norm = normalize_to_01(tb_morph_detrend)
-
-    # Fuse: ref_morph_detrend - tb_morph_detrend
+    # Fuse: ref_morph_detrend - tb_morph_detrend.
     diff = ref_morph_detrend - tb_morph_detrend
-    diff_norm = normalize_to_01(diff)
 
-    # Take top 10% as binary
-    threshold_top10 = np.nanpercentile(diff, 90)
-    binary = np.where(np.isfinite(diff) & (diff >= threshold_top10), 1, 0)
+    # Take top pixels as binary.
+    threshold_top = np.nanpercentile(diff, 90)
+    binary = np.where(np.isfinite(diff) & (diff >= threshold_top), 1, 0)
 
-    # Skeletonize the cleaned binary image to get single-pixel-wide lines
+    # Skeletonize the binary image to get single-pixel-wide lines.
     skeleton = skeletonize(binary.astype(bool))
 
-    # Probabilistic Hough transform on the skeleton
-    # Returns list of line segments: [(x1, y1), (x2, y2)]
+    # Probabilistic Hough transform on the skeleton.
+    # Returns list of line segments: [(x1, y1), (x2, y2)].
     lines_pixels = probabilistic_hough_line(
         skeleton,
         threshold=hough_threshold,
@@ -644,14 +594,9 @@ def detect_lines(ref_residual, tb_residual, grid_lon, grid_lat,
     )
 
     # Do not apply the old km-length filter before duplicate suppression.
-    # All Hough outputs are first passed into NMS so that short duplicate
-    # fragments can still be removed by nearby longer segments.
     candidate_lines_pixels = list(lines_pixels)
 
     # Group duplicate Hough line segments and replace each group with one fitted line.
-    # Criteria: similar angle + small perpendicular distance + overlapping
-    # projection or small along-line gap. The previous version kept the longest
-    # segment; this version fits one line to all endpoints in each duplicate group.
     kept_lines_pixels = suppress_duplicate_lines(candidate_lines_pixels)
 
     # After duplicate suppression, remove short remaining segments.
@@ -676,23 +621,14 @@ def detect_lines(ref_residual, tb_residual, grid_lon, grid_lat,
             return float(grid_lon[yi, xi]), float(grid_lat[yi, xi])
         return None
 
-    def pixel_lines_to_lonlat(pixel_lines):
-        lines_lonlat = []
-        for (x1, y1), (x2, y2) in pixel_lines:
-            p1 = safe_lookup(y1, x1)
-            p2 = safe_lookup(y2, x2)
-            if p1 is not None and p2 is not None:
-                lines_lonlat.append((p1[0], p1[1], p2[0], p2[1]))
-        return lines_lonlat
+    lines_lonlat = []
+    for (x1, y1), (x2, y2) in final_lines_pixels:
+        p1 = safe_lookup(y1, x1)
+        p2 = safe_lookup(y2, x2)
+        if p1 is not None and p2 is not None:
+            lines_lonlat.append((p1[0], p1[1], p2[0], p2[1]))
 
-    # Map lines before NMS and final fitted retained lines to lon/lat.
-    lines_lonlat_before_nms = pixel_lines_to_lonlat(candidate_lines_pixels)
-    lines_lonlat = pixel_lines_to_lonlat(final_lines_pixels)
-
-    return (lines_lonlat, lines_lonlat_before_nms,
-            ref_norm, tb_norm, ref_enhanced, tb_enhanced,
-            ref_morph_detrend_norm, tb_morph_detrend_norm,
-            diff_norm, binary, skeleton)
+    return lines_lonlat
 
 
 # ============================================================
@@ -707,142 +643,63 @@ def get_color_limits(data):
     return (0, 1) if (not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin) else (vmin, vmax)
 
 
-def plot_results(stem, ref_grid, tb_grid, kept_lines_lonlat, before_nms_lines_lonlat,
-                 grid_lon, grid_lat,
-                 ref_norm=None, tb_norm=None,
-                 ref_enhanced=None, tb_enhanced=None,
-                 ref_morph_detrend=None, tb_morph_detrend=None,
-                 diff_norm=None, binary=None, skeleton=None):
-    """
-    Plot only useful diagnostic panels.
-
-    Layout:
-      Row 0: Ref original | Ref residual | Ref enhanced | Ref morph + detrend
-      Row 1: BT original  | BT residual  | BT enhanced  | BT morph + detrend
-      Row 2: Diff         | Binary       | Skeleton
-      Row 3: BT + lines before NMS | BT + final lines after NMS and 60 km filter
-
-    Empty subplots and the unused information panel are removed.
-    """
-    ref_vmin, ref_vmax = get_color_limits(ref_grid)
+def plot_results(stem, tb_grid, fitted_lines_lonlat, grid_lon, grid_lat):
+    """Plot one output panel: BT original image with final fitted lines."""
     tb_vmin, tb_vmax = get_color_limits(tb_grid)
-
     extent = [grid_lon[0, 0], grid_lon[0, -1], grid_lat[0, 0], grid_lat[-1, 0]]
 
     # Keep only lines whose endpoints are inside the base grid extent.
     lon_min, lon_max = extent[0], extent[1]
     lat_min, lat_max = extent[2], extent[3]
+    filtered_lines = []
+    for lon1, lat1, lon2, lat2 in fitted_lines_lonlat:
+        if (lon_min <= lon1 <= lon_max and lat_min <= lat1 <= lat_max and
+            lon_min <= lon2 <= lon_max and lat_min <= lat2 <= lat_max):
+            filtered_lines.append((lon1, lat1, lon2, lat2))
 
-    def filter_lines_inside_extent(lines_lonlat):
-        filtered_lines = []
-        for lon1, lat1, lon2, lat2 in lines_lonlat:
-            if (lon_min <= lon1 <= lon_max and lat_min <= lat1 <= lat_max and
-                lon_min <= lon2 <= lon_max and lat_min <= lat2 <= lat_max):
-                filtered_lines.append((lon1, lat1, lon2, lat2))
-        return filtered_lines
-
-    kept_lines_lonlat = filter_lines_inside_extent(kept_lines_lonlat)
-    before_nms_lines_lonlat = filter_lines_inside_extent(before_nms_lines_lonlat)
-
-    fig = plt.figure(figsize=(24, 19), dpi=200)
-    gs = fig.add_gridspec(
-        nrows=4,
-        ncols=12,
-        height_ratios=[1.0, 1.0, 1.0, 1.05],
-        hspace=0.35,
-        wspace=0.45
+    fig, ax = plt.subplots(figsize=(8, 7), dpi=150)
+    im = ax.imshow(
+        tb_grid,
+        cmap="gray",
+        vmin=tb_vmin,
+        vmax=tb_vmax,
+        extent=extent,
+        origin="lower",
+        interpolation="none"
     )
 
-    def add_image(ax, data, title, vmin=None, vmax=None, add_colorbar=True):
-        im = ax.imshow(
-            data,
-            cmap="gray",
-            vmin=vmin,
-            vmax=vmax,
-            extent=extent,
-            origin="lower",
-            interpolation="none"
-        )
-        ax.set_title(title, fontsize=9)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        if add_colorbar:
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        return im
+    for lon1, lat1, lon2, lat2 in filtered_lines:
+        ax.plot([lon1, lon2], [lat1, lat2], "-", color="red", linewidth=1.6)
 
-    # ---- Row 0: Reflectance ----
-    add_image(fig.add_subplot(gs[0, 0:3]), ref_grid,
-              "Reflectance 2.1um (original)", ref_vmin, ref_vmax)
-    add_image(fig.add_subplot(gs[0, 3:6]), ref_norm,
-              "Reflectance residual (before morph)", 0, 1)
-    add_image(fig.add_subplot(gs[0, 6:9]), ref_enhanced,
-              f"Reflectance enhanced (kernel={MORPH_KERNEL_SIZE})", 0, 1)
-    add_image(fig.add_subplot(gs[0, 9:12]), ref_morph_detrend,
-              "Reflectance morph + detrend", 0, 1)
-
-    # ---- Row 1: BT diff ----
-    add_image(fig.add_subplot(gs[1, 0:3]), tb_grid,
-              "BT Diff 11um - 3.7um (original)", tb_vmin, tb_vmax)
-    add_image(fig.add_subplot(gs[1, 3:6]), tb_norm,
-              "BT Diff residual (before morph)", 0, 1)
-    add_image(fig.add_subplot(gs[1, 6:9]), tb_enhanced,
-              f"BT Diff enhanced (kernel={MORPH_KERNEL_SIZE})", 0, 1)
-    add_image(fig.add_subplot(gs[1, 9:12]), tb_morph_detrend,
-              "BT Diff morph + detrend", 0, 1)
-
-    # ---- Row 2: Fusion and line mask ----
-    add_image(fig.add_subplot(gs[2, 0:4]), diff_norm,
-              "Diff (ref - bt) after morph+detrend", 0, 1)
-    add_image(fig.add_subplot(gs[2, 4:8]), binary,
-              "Binary (top 10% of diff)", 0, 1, add_colorbar=False)
-    add_image(fig.add_subplot(gs[2, 8:12]), skeleton,
-              "Skeleton (single-pixel lines)", 0, 1, add_colorbar=False)
-
-    # ---- Row 3: Hough lines before and after duplicate suppression ----
-    ax = fig.add_subplot(gs[3, 0:6])
-    ax.imshow(tb_grid, cmap="gray", vmin=tb_vmin, vmax=tb_vmax,
-              extent=extent, origin="lower", interpolation="none")
-    for lon1, lat1, lon2, lat2 in before_nms_lines_lonlat:
-        ax.plot([lon1, lon2], [lat1, lat2], "-", color="red", linewidth=1.2)
-    ax.set_title(f"BT Diff + lines before NMS ({len(before_nms_lines_lonlat)} lines)", fontsize=9)
+    ax.set_title(f"BT Diff + fitted lines ({len(filtered_lines)} lines)", fontsize=10)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    ax = fig.add_subplot(gs[3, 6:12])
-    ax.imshow(tb_grid, cmap="gray", vmin=tb_vmin, vmax=tb_vmax,
-              extent=extent, origin="lower", interpolation="none")
-    for lon1, lat1, lon2, lat2 in kept_lines_lonlat:
-        ax.plot([lon1, lon2], [lat1, lat2], "-", color="red", linewidth=1.5)
-    ax.set_title(f"BT Diff + final lines ({len(kept_lines_lonlat)} lines)", fontsize=9)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-
-    fig.suptitle(stem, fontsize=14, y=0.99)
-    fig.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_canny_combined.png"),
-                bbox_inches="tight", dpi=200)
+    fig.suptitle(stem, fontsize=12, y=0.98)
+    fig.tight_layout()
+    fig.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_bt_fitted_lines.png"),
+                bbox_inches="tight", dpi=150)
     plt.close(fig)
 
-    print(f"Saved combined figure for {stem} ({len(kept_lines_lonlat)} final lines)")
+    print(f"Saved BT fitted-line figure for {stem} ({len(filtered_lines)} final lines)")
 
 
 # ============================================================
 # Main processing
 # ============================================================
 
-def read_band_and_grid(dataset, band_name, var_path, scales_attr, offsets_attr,
-                       lat, lon, grid_lon, grid_lat):
+def read_band_raw(dataset, band_name, var_path, scales_attr, offsets_attr):
+    """Read one scaled MODIS band without interpolation."""
     var = dataset[var_path]
     idx = get_band_index(var, band_name)
-    data = read_and_scale_band(var, idx, scales_attr, offsets_attr)
-    lat_resized = resize_2d(lat, data.shape)
-    lon_resized = resize_2d(lon, data.shape)
-    return resample_to_grid(data, lon_resized, lat_resized, grid_lon, grid_lat, margin_deg=CROP_MARGIN_DEG)
+    return read_and_scale_band(var, idx, scales_attr, offsets_attr)
 
 
 def process_nc_files():
     os.makedirs(LINES_OUT_DIR, exist_ok=True)
 
-    # Build base (non-rotated) grid for base maps
+    # Build base (non-rotated) grid for base maps.
     base_lon, base_lat, _, _ = build_base_grid(
         CENTER_LON, CENTER_LAT, SIDE_LENGTH_KM, RESOLUTION_M)
 
@@ -878,10 +735,11 @@ def process_nc_files():
                 print(f"Skipped (out of swath): {stem}")
                 continue
 
-            # Read and interpolate to base grid
-            ref_base, ref_valid = read_band_and_grid(
-                dataset, 7, REFSB_500_PATH, "reflectance_scales", "reflectance_offsets",
-                lat, lon, base_lon, base_lat)
+            # Read raw Ref and BT-difference fields first. Ref and BT are assumed
+            # to share the same geolocation mapping, so lon/lat are resized once
+            # and reused for both gridded variables.
+            ref_raw = read_band_raw(
+                dataset, 7, REFSB_500_PATH, "reflectance_scales", "reflectance_offsets")
 
             emissive_var = dataset[EMISSIVE_PATH]
             rad_11 = read_and_scale_band(emissive_var, get_band_index(emissive_var, 31),
@@ -890,40 +748,43 @@ def process_nc_files():
                                          "radiance_scales", "radiance_offsets")
             tb_diff = radiance2tb(rad_11, 11.0) - radiance2tb(rad_37, 3.7)
 
-            lat_tb = resize_2d(lat, tb_diff.shape)
-            lon_tb = resize_2d(lon, tb_diff.shape)
-            tb_base, tb_valid = resample_to_grid(tb_diff, lon_tb, lat_tb, base_lon, base_lat,
-                                                  margin_deg=CROP_MARGIN_DEG)
+            if ref_raw.shape != tb_diff.shape:
+                raise ValueError(
+                    f"Ref and BT arrays do not have the same shape for {stem}: "
+                    f"ref={ref_raw.shape}, tb={tb_diff.shape}. "
+                    "The shared-geolocation shortcut requires equal shapes."
+                )
+
+            common_lat = resize_2d(lat, ref_raw.shape)
+            common_lon = resize_2d(lon, ref_raw.shape)
+
+            ref_base, ref_valid = resample_to_grid(
+                ref_raw, common_lon, common_lat, base_lon, base_lat,
+                margin_deg=CROP_MARGIN_DEG)
+            tb_base, tb_valid = resample_to_grid(
+                tb_diff, common_lon, common_lat, base_lon, base_lat,
+                margin_deg=CROP_MARGIN_DEG)
 
             if not np.all(ref_valid) or not np.all(tb_valid):
                 print(f"Skipped (invalid data): {stem}")
                 continue
 
-            # Step 1: Remove 2D trend using median filtering
+            # Step 1: Remove 2D trend using median filtering.
             ref_residual, _ = remove_trend_median(ref_base, TREND_FILTER_SIZE)
             tb_residual, _ = remove_trend_median(tb_base, TREND_FILTER_SIZE)
 
-            # Step 2: Detect lines
-            (lines_lonlat, lines_lonlat_before_nms,
-             ref_norm, tb_norm, ref_enhanced, tb_enhanced,
-             ref_morph_detrend, tb_morph_detrend,
-             diff_norm, binary, skeleton) = detect_lines(
+            # Step 2: Detect final fitted lines.
+            lines_lonlat = detect_lines(
                 ref_residual, tb_residual, base_lon, base_lat,
                 HOUGH_THRESHOLD, HOUGH_MIN_LINE_LENGTH, HOUGH_MAX_LINE_GAP)
 
-            # Step 3: Plot results
-            plot_results(stem, ref_base, tb_base,
-                         lines_lonlat, lines_lonlat_before_nms,
-                         base_lon, base_lat,
-                         ref_norm=ref_norm, tb_norm=tb_norm,
-                         ref_enhanced=ref_enhanced, tb_enhanced=tb_enhanced,
-                         ref_morph_detrend=ref_morph_detrend, tb_morph_detrend=tb_morph_detrend,
-                         diff_norm=diff_norm, binary=binary, skeleton=skeleton)
+            # Step 3: Plot only BT original image + final fitted lines.
+            plot_results(stem, tb_base, lines_lonlat, base_lon, base_lat)
 
         finally:
             dataset.close()
 
-    print(f"Done processing {stem}")
+    print(f"Done processing {len(files_to_process)} selected file(s)")
 
 
 def main():

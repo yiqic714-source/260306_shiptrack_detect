@@ -21,7 +21,7 @@ from netCDF4 import Dataset
 from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator
 from scipy.ndimage import median_filter
 from skimage.feature import canny
-from skimage.transform import hough_line, hough_line_peaks
+from skimage.transform import probabilistic_hough_line
 
 
 # ============================================================
@@ -71,8 +71,10 @@ CANNY_SIGMA = 6.0
 CANNY_LOW_THRESHOLD = 0.05
 CANNY_HIGH_THRESHOLD = 0.15
 
-# Hough transform parameters
-HOUGH_THRESHOLD_FRAC = 0.3   # fraction of max accumulator value as threshold
+# Hough transform parameters (probabilistic Hough)
+HOUGH_THRESHOLD = 10          # accumulator threshold for probabilistic Hough
+HOUGH_MIN_LINE_LENGTH = 50    # minimum line length in pixels
+HOUGH_MAX_LINE_GAP = 10       # maximum gap between segments to connect
 HOUGH_MIN_LINE_LENGTH_KM = 50.0  # minimum line length in km
 
 # Morphological enhancement kernel size
@@ -331,7 +333,8 @@ def enhance_morphological(data, erode_small=True, kernel_size=3):
 
 def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
                              canny_sigma, low_threshold, high_threshold,
-                             hough_threshold_frac, min_line_length_km):
+                             hough_threshold, hough_min_line_length,
+                             hough_max_line_gap, min_line_length_km):
     """
     Apply morphological enhancement, then Canny edge detection separately
     to Reflectance and BT diff residuals, merge the edges (OR), then extract
@@ -425,49 +428,24 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
     # Merge edges with OR
     edges_merged = edges_ref | edges_tb
 
-    # Hough transform on the binary top-10% image
-    h, theta, d = hough_line(binary)
+    # Probabilistic Hough transform on the binary top-10% image
+    # Returns list of line segments: [(x1, y1), (x2, y2)]
+    lines_pixels = probabilistic_hough_line(
+        binary,
+        threshold=hough_threshold,
+        line_length=hough_min_line_length,
+        line_gap=hough_max_line_gap
+    )
 
-    # Find peaks in Hough accumulator
-    threshold = hough_threshold_frac * np.max(h)
-    _, angles, dists = hough_line_peaks(h, theta, d, threshold=threshold)
-
-    if len(angles) == 0:
-        return [], edges_ref, edges_tb, edges_merged, ref_norm, tb_norm, ref_enhanced, tb_enhanced, ref_morph_detrend_norm, tb_morph_detrend_norm, diff_norm, binary
-
-    # Convert Hough lines to line segments in pixel coordinates
-    lines_pixels = []
-    for angle, dist in zip(angles, dists):
-        cos_a = np.cos(angle)
-        sin_a = np.sin(angle)
-
-        intersections = []
-
-        # Intersection with left/right boundaries (x = 0, x = n_cols-1)
-        if abs(sin_a) > 1e-10:
-            for x in [0, n_cols - 1]:
-                y = (dist - x * cos_a) / sin_a
-                if 0 <= y <= n_rows - 1:
-                    intersections.append((x, y))
-
-        # Intersection with top/bottom boundaries (y = 0, y = n_rows-1)
-        if abs(cos_a) > 1e-10:
-            for y in [0, n_rows - 1]:
-                x = (dist - y * sin_a) / cos_a
-                if 0 <= x <= n_cols - 1:
-                    intersections.append((x, y))
-
-        if len(intersections) >= 2:
-            pts = np.array(intersections[:2])
-            dx_km = (pts[1, 0] - pts[0, 0]) * RESOLUTION_M / 1000.0
-            dy_km = (pts[1, 1] - pts[0, 1]) * RESOLUTION_M / 1000.0
-            length_km = np.hypot(dx_km, dy_km)
-            if length_km >= min_line_length_km:
-                lines_pixels.append((pts[0, 1], pts[0, 0], pts[1, 1], pts[1, 0]))
-
-    # Map to lon/lat
+    # Filter by minimum length in km and map to lon/lat
     lines_lonlat = []
-    for y1, x1, y2, x2 in lines_pixels:
+    for (x1, y1), (x2, y2) in lines_pixels:
+        dx_km = (x2 - x1) * RESOLUTION_M / 1000.0
+        dy_km = (y2 - y1) * RESOLUTION_M / 1000.0
+        length_km = np.hypot(dx_km, dy_km)
+        if length_km < min_line_length_km:
+            continue
+
         def safe_lookup(y, x):
             yi = int(round(y))
             xi = int(round(x))
@@ -681,7 +659,9 @@ def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
         f"Morph kernel: {MORPH_KERNEL_SIZE}\n"
         f"Canny sigma: {CANNY_SIGMA}\n"
         f"Canny low/high: {CANNY_LOW_THRESHOLD}/{CANNY_HIGH_THRESHOLD}\n"
-        f"Hough threshold frac: {HOUGH_THRESHOLD_FRAC}\n"
+        f"Hough threshold: {HOUGH_THRESHOLD}\n"
+        f"Hough line length: {HOUGH_MIN_LINE_LENGTH}\n"
+        f"Hough line gap: {HOUGH_MAX_LINE_GAP}\n"
         f"Min line length: {HOUGH_MIN_LINE_LENGTH_KM} km\n"
         f"Detected lines: {len(all_lines_lonlat)}"
     )
@@ -784,7 +764,8 @@ def process_nc_files():
              diff_norm, binary) = detect_lines_canny_hough(
                 ref_residual, tb_residual, base_lon, base_lat,
                 CANNY_SIGMA, CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD,
-                HOUGH_THRESHOLD_FRAC, HOUGH_MIN_LINE_LENGTH_KM)
+                HOUGH_THRESHOLD, HOUGH_MIN_LINE_LENGTH, HOUGH_MAX_LINE_GAP,
+                HOUGH_MIN_LINE_LENGTH_KM)
 
             # Step 3: Plot results
             plot_results(stem, ref_base, tb_base, lines_lonlat, base_lon, base_lat,

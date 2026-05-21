@@ -1,14 +1,17 @@
 """
-Canny-based line detection for MODIS gridded data.
+Line detection for MODIS gridded data.
 
 Workflow:
 1. Read MYD021 files and interpolate to a base (non-rotated) square grid.
 2. Remove 2D large-scale trend using median filtering.
-3. Fuse Reflectance and BT-diff into a single image.
-4. Apply Canny edge detection on the fused image.
-5. Extract straight lines using Hough transform.
-6. Filter short lines and lines outside the base grid extent.
-7. Plot: 2x2 subplots (Ref base, BT base, Ref+lines, BT+lines).
+3. Apply morphological enhancement (dilation for Ref, erosion for BT).
+4. Second trend removal after morphological enhancement.
+5. Fuse: ref_morph_detrend - tb_morph_detrend.
+6. Binarize: top 10% of fused image.
+7. Clean binary with dilation+erosion, then skeletonize.
+8. Extract straight lines using probabilistic Hough transform.
+9. Filter short lines and lines outside the base grid extent.
+10. Plot: 4x4 subplots showing all intermediate steps.
 """
 
 import os
@@ -20,7 +23,7 @@ from matplotlib.path import Path
 from netCDF4 import Dataset
 from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator
 from scipy.ndimage import median_filter
-from skimage.feature import canny
+from skimage.morphology import skeletonize
 from skimage.transform import probabilistic_hough_line
 
 
@@ -60,25 +63,24 @@ RUN_FILE_END = 8
 
 
 # ============================================================
-# Canny / Hough detection settings
+# Detection settings
 # ============================================================
 
 # Median filter kernel size for background removal (must be odd)
 TREND_FILTER_SIZE = 101
 
-# Canny parameters
-CANNY_SIGMA = 6.0
-CANNY_LOW_THRESHOLD = 0.05
-CANNY_HIGH_THRESHOLD = 0.15
-
 # Hough transform parameters (probabilistic Hough)
 HOUGH_THRESHOLD = 10          # accumulator threshold for probabilistic Hough
 HOUGH_MIN_LINE_LENGTH = 50    # minimum line length in pixels
-HOUGH_MAX_LINE_GAP = 10       # maximum gap between segments to connect
+HOUGH_MAX_LINE_GAP = 30       # maximum gap between segments to connect
 HOUGH_MIN_LINE_LENGTH_KM = 50.0  # minimum line length in km
 
 # Morphological enhancement kernel size
 MORPH_KERNEL_SIZE = 20
+
+# Binary cleanup: dilation then erosion iterations
+BINARY_DILATE_ITER = 1
+BINARY_ERODE_ITER = 1
 
 
 
@@ -328,20 +330,16 @@ def enhance_morphological(data, erode_small=True, kernel_size=3):
 
 
 # ============================================================
-# Canny + Hough line detection
+# Line detection
 # ============================================================
 
-def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
-                             canny_sigma, low_threshold, high_threshold,
-                             hough_threshold, hough_min_line_length,
-                             hough_max_line_gap, min_line_length_km):
+def detect_lines(ref_residual, tb_residual, grid_lon, grid_lat,
+                 hough_threshold, hough_min_line_length,
+                 hough_max_line_gap, min_line_length_km):
     """
-    Apply morphological enhancement, then Canny edge detection separately
-    to Reflectance and BT diff residuals, merge the edges (OR), then extract
-    straight lines using Hough transform.
-
-    For Reflectance: erode small values, dilate large values.
-    For BT diff: erode large values, dilate small values.
+    Apply morphological enhancement, second trend removal, fuse,
+    binarize (top 10%), clean with binary morph, skeletonize,
+    then extract straight lines using probabilistic Hough transform.
 
     Parameters
     ----------
@@ -349,12 +347,12 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
         Residual images after trend removal.
     grid_lon, grid_lat : ndarray
         Lon/lat of the base grid.
-    canny_sigma : float
-        Sigma for Canny Gaussian smoothing.
-    low_threshold, high_threshold : float
-        Thresholds for Canny (in fraction of dynamic range).
-    hough_threshold_frac : float
-        Fraction of max accumulator value as Hough threshold.
+    hough_threshold : int
+        Accumulator threshold for probabilistic Hough.
+    hough_min_line_length : int
+        Minimum line length in pixels for probabilistic Hough.
+    hough_max_line_gap : int
+        Maximum gap between segments to connect.
     min_line_length_km : float
         Minimum line length in km.
 
@@ -362,12 +360,6 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
     -------
     lines_lonlat : list of (lon1, lat1, lon2, lat2)
         Detected lines in lon/lat coordinates.
-    edges_ref : ndarray
-        Binary edge map from Reflectance Canny.
-    edges_tb : ndarray
-        Binary edge map from BT diff Canny.
-    edges_merged : ndarray
-        Merged edge map (OR of both).
     ref_norm : ndarray
         Normalized Reflectance residual (before morphological enhancement).
     tb_norm : ndarray
@@ -380,6 +372,14 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
         Reflectance after morph + second trend removal.
     tb_morph_detrend : ndarray
         BT diff after morph + second trend removal.
+    diff_norm : ndarray
+        Normalized diff (ref - bt) after morph+detrend.
+    binary : ndarray
+        Binary image (top 10% of diff).
+    binary_clean : ndarray
+        Binary after dilation+erosion.
+    skeleton : ndarray
+        Skeletonized binary (single-pixel-wide lines).
     """
     n_rows, n_cols = ref_residual.shape
 
@@ -417,21 +417,18 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
     threshold_top10 = np.nanpercentile(diff, 90)
     binary = np.where(np.isfinite(diff) & (diff >= threshold_top10), 1, 0)
 
-    # Canny edge detection separately on each enhanced image (for display only)
-    edges_ref = canny(ref_enhanced, sigma=canny_sigma,
-                      low_threshold=low_threshold,
-                      high_threshold=high_threshold)
-    edges_tb = canny(tb_enhanced, sigma=canny_sigma,
-                     low_threshold=low_threshold,
-                     high_threshold=high_threshold)
+    # Clean binary image: dilate then erode to connect nearby pixels
+    from scipy.ndimage import binary_dilation, binary_erosion
+    binary_clean = binary_dilation(binary, iterations=BINARY_DILATE_ITER)
+    binary_clean = binary_erosion(binary_clean, iterations=BINARY_ERODE_ITER)
 
-    # Merge edges with OR
-    edges_merged = edges_ref | edges_tb
+    # Skeletonize the cleaned binary image to get single-pixel-wide lines
+    skeleton = skeletonize(binary_clean.astype(bool))
 
-    # Probabilistic Hough transform on the binary top-10% image
+    # Probabilistic Hough transform on the skeleton
     # Returns list of line segments: [(x1, y1), (x2, y2)]
     lines_pixels = probabilistic_hough_line(
-        binary,
+        skeleton,
         threshold=hough_threshold,
         line_length=hough_min_line_length,
         line_gap=hough_max_line_gap
@@ -458,7 +455,7 @@ def detect_lines_canny_hough(ref_residual, tb_residual, grid_lon, grid_lat,
         if p1 is not None and p2 is not None:
             lines_lonlat.append((p1[0], p1[1], p2[0], p2[1]))
 
-    return lines_lonlat, edges_ref, edges_tb, edges_merged, ref_norm, tb_norm, ref_enhanced, tb_enhanced, ref_morph_detrend_norm, tb_morph_detrend_norm, diff_norm, binary
+    return lines_lonlat, ref_norm, tb_norm, ref_enhanced, tb_enhanced, ref_morph_detrend_norm, tb_morph_detrend_norm, diff_norm, binary, binary_clean, skeleton
 
 
 # ============================================================
@@ -478,13 +475,13 @@ def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
                  ref_enhanced=None, tb_enhanced=None,
                  ref_morph_detrend=None, tb_morph_detrend=None,
                  diff_norm=None, binary=None,
-                 edges_ref=None, edges_tb=None, edges_merged=None):
+                 binary_clean=None, skeleton=None):
     """
     Plot a single figure with 4x4 subplots:
       Row 0: Ref original | Ref residual (before morph) | Ref enhanced (after morph) | Ref morph + detrend
       Row 1: BT original  | BT residual (before morph)  | BT enhanced (after morph)  | BT morph + detrend
-      Row 2: Ref Canny edges | BT Canny edges | Merged Canny edges | Diff (ref - bt)
-      Row 3: Ref + lines  | BT + lines | Binary (top 10%) | (info)
+      Row 2: Diff (ref - bt) | Binary (top 10%) | Binary cleaned (dil+erode) | Skeleton
+      Row 3: Ref + lines  | BT + lines | (info) | (empty)
 
     Lines whose endpoints fall outside the base grid extent are filtered out.
     """
@@ -585,38 +582,41 @@ def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
-    # ---- Row 2: Canny edges ----
-    # (2,0) Ref Canny edges
+    # ---- Row 2: Diff and Binary ----
+    # (2,0) Diff (ref - bt)
     ax = axes[2, 0]
-    if edges_ref is not None:
-        ax.imshow(edges_ref, cmap="gray", extent=extent, origin="lower", interpolation="none")
-        ax.set_title("Canny edges (Reflectance)", fontsize=9)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-
-    # (2,1) BT Canny edges
-    ax = axes[2, 1]
-    if edges_tb is not None:
-        ax.imshow(edges_tb, cmap="gray", extent=extent, origin="lower", interpolation="none")
-        ax.set_title("Canny edges (BT diff)", fontsize=9)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-
-    # (2,2) Merged Canny edges
-    ax = axes[2, 2]
-    if edges_merged is not None:
-        ax.imshow(edges_merged, cmap="gray", extent=extent, origin="lower", interpolation="none")
-        ax.set_title(f"Merged Canny edges (sigma={CANNY_SIGMA})", fontsize=9)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-
-    # (2,3) Diff (ref - bt)
-    ax = axes[2, 3]
     if diff_norm is not None:
         im = ax.imshow(diff_norm, cmap="gray", vmin=0, vmax=1,
                        extent=extent, origin="lower", interpolation="none")
         ax.set_title("Diff (ref - bt) after morph+detrend", fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (2,1) Binary (top 10%)
+    ax = axes[2, 1]
+    if binary is not None:
+        ax.imshow(binary, cmap="gray", vmin=0, vmax=1,
+                  extent=extent, origin="lower", interpolation="none")
+        ax.set_title("Binary (top 10% of diff)", fontsize=9)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (2,2) Binary cleaned (dil+erode)
+    ax = axes[2, 2]
+    if binary_clean is not None:
+        ax.imshow(binary_clean, cmap="gray", vmin=0, vmax=1,
+                  extent=extent, origin="lower", interpolation="none")
+        ax.set_title("Binary cleaned (dilate+erode)", fontsize=9)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # (2,3) Skeleton
+    ax = axes[2, 3]
+    if skeleton is not None:
+        ax.imshow(skeleton, cmap="gray", vmin=0, vmax=1,
+                  extent=extent, origin="lower", interpolation="none")
+        ax.set_title("Skeleton (single-pixel lines)", fontsize=9)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
@@ -641,33 +641,28 @@ def plot_results(stem, ref_grid, tb_grid, all_lines_lonlat, grid_lon, grid_lat,
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
-    # (3,2) Binary (top 10%)
+    # (3,2) Info
     ax = axes[3, 2]
-    if binary is not None:
-        ax.imshow(binary, cmap="gray", vmin=0, vmax=1,
-                  extent=extent, origin="lower", interpolation="none")
-        ax.set_title("Binary (top 10% of diff)", fontsize=9)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-
-    # (3,3) Info
-    ax = axes[3, 3]
     ax.axis("off")
     info_text = (
         f"File: {stem}\n"
         f"Filter size: {TREND_FILTER_SIZE}\n"
         f"Morph kernel: {MORPH_KERNEL_SIZE}\n"
-        f"Canny sigma: {CANNY_SIGMA}\n"
-        f"Canny low/high: {CANNY_LOW_THRESHOLD}/{CANNY_HIGH_THRESHOLD}\n"
         f"Hough threshold: {HOUGH_THRESHOLD}\n"
         f"Hough line length: {HOUGH_MIN_LINE_LENGTH}\n"
         f"Hough line gap: {HOUGH_MAX_LINE_GAP}\n"
         f"Min line length: {HOUGH_MIN_LINE_LENGTH_KM} km\n"
+        f"Binary dilate iter: {BINARY_DILATE_ITER}\n"
+        f"Binary erode iter: {BINARY_ERODE_ITER}\n"
         f"Detected lines: {len(all_lines_lonlat)}"
     )
     ax.text(0.5, 0.5, info_text, transform=ax.transAxes,
             fontsize=10, ha='center', va='center',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # (3,3) empty
+    ax = axes[3, 3]
+    ax.axis("off")
 
     fig.suptitle(stem, fontsize=14, y=0.98)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -757,13 +752,11 @@ def process_nc_files():
             ref_residual, ref_background = remove_trend_median(ref_base, TREND_FILTER_SIZE)
             tb_residual, tb_background = remove_trend_median(tb_base, TREND_FILTER_SIZE)
 
-            # Step 2: Detect lines using Canny + Hough (separately on each variable)
-            (lines_lonlat, edges_ref, edges_tb, edges_merged,
-             ref_norm, tb_norm, ref_enhanced, tb_enhanced,
+            # Step 2: Detect lines
+            (lines_lonlat, ref_norm, tb_norm, ref_enhanced, tb_enhanced,
              ref_morph_detrend, tb_morph_detrend,
-             diff_norm, binary) = detect_lines_canny_hough(
+             diff_norm, binary, binary_clean, skeleton) = detect_lines(
                 ref_residual, tb_residual, base_lon, base_lat,
-                CANNY_SIGMA, CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD,
                 HOUGH_THRESHOLD, HOUGH_MIN_LINE_LENGTH, HOUGH_MAX_LINE_GAP,
                 HOUGH_MIN_LINE_LENGTH_KM)
 
@@ -773,7 +766,7 @@ def process_nc_files():
                          ref_enhanced=ref_enhanced, tb_enhanced=tb_enhanced,
                          ref_morph_detrend=ref_morph_detrend, tb_morph_detrend=tb_morph_detrend,
                          diff_norm=diff_norm, binary=binary,
-                         edges_ref=edges_ref, edges_tb=edges_tb, edges_merged=edges_merged)
+                         binary_clean=binary_clean, skeleton=skeleton)
 
         finally:
             dataset.close()

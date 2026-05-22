@@ -8,25 +8,27 @@ Workflow:
 4. Second trend removal after morphological enhancement.
 5. Fuse: ref_morph_detrend - tb_morph_detrend.
 6. Binarize: top 10% of fused image.
-7. Skeletonize the binary image.
-8. Extract straight lines using probabilistic Hough transform.
+7. Clean the binary image with dilation followed by erosion.
+8. Skeletonize the cleaned binary image.
+9. Extract straight lines using probabilistic Hough transform.
 9. Group duplicate nearby parallel Hough segments.
    Shorter segments use a larger angle tolerance during duplicate grouping.
 10. Replace each duplicate group with one fitted representative line.
 11. After duplicate-group fitting, remove line segments shorter than 60 km.
-12. Plot only one output panel: BT original image with final fitted lines.
-13. Ref and BT are assumed to share the same geolocation mapping, so lat/lon resizing is done once.
+12. Optionally plot two output panels: raw binary mask before cleanup and BT original image with final fitted lines.
+13. Save final fitted-line information for each file to an individual CSV.
+14. Ref and BT are assumed to share the same geolocation mapping, so lat/lon resizing is done once.
 """
 
+import csv
 import os
 from glob import glob
 
-import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.path import Path
 from netCDF4 import Dataset
 from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator
-from scipy.ndimage import median_filter
+from scipy.ndimage import binary_dilation, binary_erosion, median_filter
 from skimage.morphology import skeletonize
 from skimage.transform import probabilistic_hough_line
 
@@ -37,6 +39,11 @@ from skimage.transform import probabilistic_hough_line
 
 INPUT_DIR = "/home/chenyiqi/260306_shiptrack_detect/MYD021_SE_Pacific"
 LINES_OUT_DIR = "/home/chenyiqi/260306_shiptrack_detect/lines_figs"
+LINES_CSV_DIR = "/home/chenyiqi/260306_shiptrack_detect/line_csvs"
+
+# Output switches
+SAVE_FIGURES = True
+SAVE_LINE_CSV = True
 
 
 # ============================================================
@@ -61,8 +68,8 @@ k = 1.380649e-23
 # File range control, 1-based inclusive
 # ============================================================
 
-RUN_FILE_START = 74
-RUN_FILE_END = 100
+RUN_FILE_START = 90
+RUN_FILE_END = 90
 
 
 # ============================================================
@@ -73,13 +80,18 @@ RUN_FILE_END = 100
 TREND_FILTER_SIZE = 101
 
 # Hough transform parameters (probabilistic Hough)
-HOUGH_THRESHOLD = 10          # accumulator threshold for probabilistic Hough
-HOUGH_MIN_LINE_LENGTH = 45    # minimum line length in pixels for Hough transform
+HOUGH_THRESHOLD = 30          # accumulator threshold for probabilistic Hough
+HOUGH_MIN_LINE_LENGTH = 50    # minimum line length in pixels for Hough transform
 HOUGH_MAX_LINE_GAP = 30       # maximum gap between segments to connect
 FINAL_MIN_LINE_LENGTH_KM = 60.0  # remove lines shorter than this after NMS
 
 # Morphological enhancement kernel size
 MORPH_KERNEL_SIZE = 20
+
+# Binary cleanup: dilation followed by erosion before skeletonization.
+# The default 3x3 structuring element is used by scipy.ndimage.
+BINARY_DILATE_ITER = 1
+BINARY_ERODE_ITER = 1
 
 # Hough line duplicate grouping / fitting settings
 # Two Hough segments are treated as duplicates only when all three
@@ -94,11 +106,11 @@ MORPH_KERNEL_SIZE = 20
 #   length <= LINE_NMS_SHORT_LENGTH_PX -> LINE_NMS_ANGLE_DEG_SHORT
 #   length >= LINE_NMS_LONG_LENGTH_PX  -> LINE_NMS_ANGLE_DEG_LONG
 #   intermediate lengths are linearly interpolated.
-LINE_NMS_ANGLE_DEG_SHORT = 35.0
+LINE_NMS_ANGLE_DEG_SHORT = 30.0
 LINE_NMS_ANGLE_DEG_LONG = 5.0
 LINE_NMS_SHORT_LENGTH_PX = float(HOUGH_MIN_LINE_LENGTH)
-LINE_NMS_LONG_LENGTH_PX = 150.0
-LINE_NMS_PERP_DIST_PX = 15.0
+LINE_NMS_LONG_LENGTH_PX = 175.0
+LINE_NMS_PERP_DIST_PX = 10.0
 LINE_NMS_MAX_PROJ_GAP_PX = 30.0
 
 
@@ -550,7 +562,7 @@ def detect_lines(ref_residual, tb_residual, grid_lon, grid_lat,
                  hough_max_line_gap):
     """
     Apply morphological enhancement, second trend removal, fusion,
-    binarization, skeletonization and probabilistic Hough transform.
+    binarization, binary cleanup, skeletonization and probabilistic Hough transform.
 
     Duplicate nearby, nearly parallel and overlapping/gapped Hough segments
     are grouped first. Each duplicate group is then replaced by one fitted
@@ -561,6 +573,8 @@ def detect_lines(ref_residual, tb_residual, grid_lon, grid_lat,
     -------
     lines_lonlat : list of (lon1, lat1, lon2, lat2)
         Final fitted representative lines in lon/lat coordinates.
+    binary : ndarray of bool
+        Raw binary image before dilation and erosion cleanup.
     """
     n_rows, n_cols = ref_residual.shape
 
@@ -577,12 +591,17 @@ def detect_lines(ref_residual, tb_residual, grid_lon, grid_lat,
     # Fuse: ref_morph_detrend - tb_morph_detrend.
     diff = ref_morph_detrend - tb_morph_detrend
 
-    # Take top pixels as binary.
-    threshold_top = np.nanpercentile(diff, 90)
-    binary = np.where(np.isfinite(diff) & (diff >= threshold_top), 1, 0)
+    # Take high-value pixels as binary.
+    threshold_top10 = np.nanpercentile(diff, 85)
+    binary = np.where(np.isfinite(diff) & (diff >= threshold_top10), 1, 0).astype(bool)
 
-    # Skeletonize the binary image to get single-pixel-wide lines.
-    skeleton = skeletonize(binary.astype(bool))
+    # Clean binary image before skeletonization:
+    # dilation connects small gaps first, then erosion restores the main width.
+    binary_clean = binary_dilation(binary, iterations=BINARY_DILATE_ITER)
+    binary_clean = binary_erosion(binary_clean, iterations=BINARY_ERODE_ITER)
+
+    # Skeletonize the cleaned binary image to get single-pixel-wide lines.
+    skeleton = skeletonize(binary_clean)
 
     # Probabilistic Hough transform on the skeleton.
     # Returns list of line segments: [(x1, y1), (x2, y2)].
@@ -628,7 +647,7 @@ def detect_lines(ref_residual, tb_residual, grid_lon, grid_lat,
         if p1 is not None and p2 is not None:
             lines_lonlat.append((p1[0], p1[1], p2[0], p2[1]))
 
-    return lines_lonlat
+    return lines_lonlat, binary
 
 
 # ============================================================
@@ -643,21 +662,101 @@ def get_color_limits(data):
     return (0, 1) if (not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin) else (vmin, vmax)
 
 
-def plot_results(stem, tb_grid, fitted_lines_lonlat, grid_lon, grid_lat):
-    """Plot one output panel: BT original image with final fitted lines."""
-    tb_vmin, tb_vmax = get_color_limits(tb_grid)
-    extent = [grid_lon[0, 0], grid_lon[0, -1], grid_lat[0, 0], grid_lat[-1, 0]]
 
-    # Keep only lines whose endpoints are inside the base grid extent.
+def get_grid_extent(grid_lon, grid_lat):
+    """Return the plotting extent of the base grid."""
+    return [grid_lon[0, 0], grid_lon[0, -1], grid_lat[0, 0], grid_lat[-1, 0]]
+
+
+def filter_lines_inside_extent(lines_lonlat, grid_lon, grid_lat):
+    """Keep only line segments whose endpoints are inside the base grid extent."""
+    extent = get_grid_extent(grid_lon, grid_lat)
     lon_min, lon_max = extent[0], extent[1]
     lat_min, lat_max = extent[2], extent[3]
+
     filtered_lines = []
-    for lon1, lat1, lon2, lat2 in fitted_lines_lonlat:
+    for lon1, lat1, lon2, lat2 in lines_lonlat:
         if (lon_min <= lon1 <= lon_max and lat_min <= lat1 <= lat_max and
             lon_min <= lon2 <= lon_max and lat_min <= lat2 <= lat_max):
             filtered_lines.append((lon1, lat1, lon2, lat2))
 
-    fig, ax = plt.subplots(figsize=(8, 7), dpi=150)
+    return filtered_lines
+
+
+def line_lonlat_metrics(lon1, lat1, lon2, lat2):
+    """Compute length, angle and center point for a lon/lat line segment."""
+    center_lon = 0.5 * (lon1 + lon2)
+    center_lat = 0.5 * (lat1 + lat2)
+
+    dx_km = (lon2 - lon1) * (EARTH_RADIUS_KM * np.cos(np.deg2rad(center_lat)) * np.pi / 180.0)
+    dy_km = (lat2 - lat1) * (EARTH_RADIUS_KM * np.pi / 180.0)
+    length_km = float(np.hypot(dx_km, dy_km))
+    angle_deg = float(np.rad2deg(np.arctan2(dy_km, dx_km)) % 180.0)
+
+    return length_km, angle_deg, center_lon, center_lat
+
+
+def save_lines_csv(stem, lines_lonlat, out_dir=LINES_CSV_DIR):
+    """Save final fitted-line information for one input file to one CSV file."""
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f"{stem}_final_lines.csv")
+
+    fieldnames = [
+        "file", "line_id",
+        "lon1", "lat1", "lon2", "lat2",
+        "length_km", "angle_deg",
+        "center_lon", "center_lat"
+    ]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for line_id, (lon1, lat1, lon2, lat2) in enumerate(lines_lonlat, start=1):
+            length_km, angle_deg, center_lon, center_lat = line_lonlat_metrics(
+                lon1, lat1, lon2, lat2)
+            writer.writerow({
+                "file": stem,
+                "line_id": line_id,
+                "lon1": f"{lon1:.8f}",
+                "lat1": f"{lat1:.8f}",
+                "lon2": f"{lon2:.8f}",
+                "lat2": f"{lat2:.8f}",
+                "length_km": f"{length_km:.3f}",
+                "angle_deg": f"{angle_deg:.3f}",
+                "center_lon": f"{center_lon:.8f}",
+                "center_lat": f"{center_lat:.8f}",
+            })
+
+    print(f"Saved final line CSV for {stem} ({len(lines_lonlat)} lines): {csv_path}")
+
+
+def plot_results(stem, tb_grid, binary, fitted_lines_lonlat, grid_lon, grid_lat):
+    """Plot two output panels: raw binary image before cleanup and BT original image with final fitted lines."""
+    import matplotlib.pyplot as plt
+
+    tb_vmin, tb_vmax = get_color_limits(tb_grid)
+    extent = get_grid_extent(grid_lon, grid_lat)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.5), dpi=150)
+
+    # Panel 1: raw binary image before dilation and erosion cleanup.
+    ax = axes[0]
+    ax.imshow(
+        binary,
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+        extent=extent,
+        origin="lower",
+        interpolation="none"
+    )
+    ax.set_title("Binary before cleanup", fontsize=10)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+    # Panel 2: current final output, BT image with fitted lines.
+    ax = axes[1]
     im = ax.imshow(
         tb_grid,
         cmap="gray",
@@ -668,22 +767,21 @@ def plot_results(stem, tb_grid, fitted_lines_lonlat, grid_lon, grid_lat):
         interpolation="none"
     )
 
-    for lon1, lat1, lon2, lat2 in filtered_lines:
+    for lon1, lat1, lon2, lat2 in fitted_lines_lonlat:
         ax.plot([lon1, lon2], [lat1, lat2], "-", color="red", linewidth=1.6)
 
-    ax.set_title(f"BT Diff + fitted lines ({len(filtered_lines)} lines)", fontsize=10)
+    ax.set_title(f"BT Diff + fitted lines ({len(fitted_lines_lonlat)} lines)", fontsize=10)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     fig.suptitle(stem, fontsize=12, y=0.98)
     fig.tight_layout()
-    fig.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_bt_fitted_lines.png"),
+    fig.savefig(os.path.join(LINES_OUT_DIR, f"{stem}_binary_bt_fitted_lines.png"),
                 bbox_inches="tight", dpi=150)
     plt.close(fig)
 
-    print(f"Saved BT fitted-line figure for {stem} ({len(filtered_lines)} final lines)")
-
+    print(f"Saved binary + BT fitted-line figure for {stem} ({len(fitted_lines_lonlat)} final lines)")
 
 # ============================================================
 # Main processing
@@ -697,7 +795,10 @@ def read_band_raw(dataset, band_name, var_path, scales_attr, offsets_attr):
 
 
 def process_nc_files():
-    os.makedirs(LINES_OUT_DIR, exist_ok=True)
+    if SAVE_FIGURES:
+        os.makedirs(LINES_OUT_DIR, exist_ok=True)
+    if SAVE_LINE_CSV:
+        os.makedirs(LINES_CSV_DIR, exist_ok=True)
 
     # Build base (non-rotated) grid for base maps.
     base_lon, base_lat, _, _ = build_base_grid(
@@ -774,12 +875,20 @@ def process_nc_files():
             tb_residual, _ = remove_trend_median(tb_base, TREND_FILTER_SIZE)
 
             # Step 2: Detect final fitted lines.
-            lines_lonlat = detect_lines(
+            lines_lonlat, binary = detect_lines(
                 ref_residual, tb_residual, base_lon, base_lat,
                 HOUGH_THRESHOLD, HOUGH_MIN_LINE_LENGTH, HOUGH_MAX_LINE_GAP)
 
-            # Step 3: Plot only BT original image + final fitted lines.
-            plot_results(stem, tb_base, lines_lonlat, base_lon, base_lat)
+            # Step 3: Filter once so the CSV and figure use the same final lines.
+            lines_lonlat = filter_lines_inside_extent(lines_lonlat, base_lon, base_lat)
+
+            # Step 4: Save final fitted-line information for this file.
+            if SAVE_LINE_CSV:
+                save_lines_csv(stem, lines_lonlat, out_dir=LINES_CSV_DIR)
+
+            # Step 5: Optionally plot raw binary image + BT original image with final fitted lines.
+            if SAVE_FIGURES:
+                plot_results(stem, tb_base, binary, lines_lonlat, base_lon, base_lat)
 
         finally:
             dataset.close()
